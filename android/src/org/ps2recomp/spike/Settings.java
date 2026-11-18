@@ -45,6 +45,9 @@ public final class Settings {
     public int opacity() { return p.getInt("opacity", 50); }                    // overlay opacity 10..100, 50 = the first look (live)
     public int size() { return p.getInt("size", 100); }                         // overlay size in percent 70..140 (live)
     public boolean dpad() { return p.getBoolean("dpad", false); }
+    /** Graphics API (needs a restart): true = OpenGL ES 3.1+ (the default), false = Vulkan (OpenGL ES only when the phone has no
+     *  working Vulkan). */
+    public boolean gles() { return p.getBoolean("gles", true); }
     public boolean fps() { return p.getBoolean("fps", true); }                    // the FPS counter in the top left corner (live)               // left control acts as D-pad instead of analog stick
     /** Default set from art/audit.md: L1, L2, R2 and Select did nothing in the tested race/pause menu, so they start hidden. */
     public boolean visible(String id) { return p.getBoolean("vis_" + id, !(id.equals("l1") || id.equals("l2") || id.equals("r2") || id.equals("select"))); }
@@ -79,6 +82,9 @@ public final class Settings {
             else android.system.Os.unsetenv("PS2_ASPECT");
             android.system.Os.setenv("PS2_SHARP_2D", String.valueOf(sharp()), true);
             android.system.Os.setenv("PS2_DISPLAY_MODE", String.valueOf(display()), true);
+            // unset: Vulkan, falling back to OpenGL ES (gpu.cpp init); "gl" asks for OpenGL ES only
+            if (gles()) android.system.Os.setenv("PS2_GPU_BACKEND", "gl", true);
+            else android.system.Os.unsetenv("PS2_GPU_BACKEND");
         } catch (Exception e) { /* keep the defaults */ }
     }
 }

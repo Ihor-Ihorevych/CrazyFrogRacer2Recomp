@@ -417,7 +417,7 @@ WGPURenderPipeline pipeline(const PipeKey &k) {
     ct.writeMask = k.mask;
     WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
     fs.module = g_module;
-    fs.entryPoint = sv(k.dual ? "fs_dual" : "fs");
+    fs.entryPoint = sv(C.gl ? (k.dual ? "fs_dual_gl" : "fs_gl") : (k.dual ? "fs_dual" : "fs"));
     fs.constantCount = 2;
     fs.constants = consts;
     fs.targetCount = 1;
@@ -429,7 +429,7 @@ WGPURenderPipeline pipeline(const PipeKey &k) {
     WGPURenderPipelineDescriptor d = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
     d.layout = g_draw_layout;
     d.vertex.module = g_module;
-    d.vertex.entryPoint = sv("vs");
+    d.vertex.entryPoint = sv(C.gl ? "vs_gl" : "vs");
     d.vertex.bufferCount = 1;
     d.vertex.buffers = &vl;
     d.primitive.topology = WGPUPrimitiveTopology_TriangleList;
@@ -461,7 +461,8 @@ WGPUSampler sampler(u32 idx) {
 
 // bindings 2 and 3: bilinear with clamp and with repeat, for a target read as a texture at another scale (hwr.wgsl sample_loads' fast path)
 WGPUBindGroup tex_group(WGPUTextureView view, u32 sampler_idx) {
-    WGPUBindGroupEntry e[4] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    WGPUBindGroupEntry e[6] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+                               WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     e[0].binding = 0;
     e[0].textureView = view;
     e[1].binding = 1;
@@ -470,9 +471,13 @@ WGPUBindGroup tex_group(WGPUTextureView view, u32 sampler_idx) {
     e[2].sampler = sampler(1 | 2 | 8 | 16);
     e[3].binding = 3;
     e[3].sampler = sampler(1 | 2);
+    e[4].binding = 4;  // the view again for bindings 2 and 3 (hwr.wgsl tex_clamp, tex_repeat: one sampler per texture for OpenGL)
+    e[4].textureView = view;
+    e[5].binding = 5;
+    e[5].textureView = view;
     WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     d.layout = g_tex_layout;
-    d.entryCount = 4;
+    d.entryCount = 6;
     d.entries = e;
     return wgpuDeviceCreateBindGroup(C.device, &d);
 }
@@ -1417,13 +1422,14 @@ bool init(const Context &ctx) {
     {
         WGPUBindGroupLayoutEntry e = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
         e.binding = 0;
-        e.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+        // OpenGL ES on Mali has no storage buffers in vertex shaders: there the fragment stage reads the records (vs_gl, fs_gl)
+        e.visibility = C.gl ? WGPUShaderStage_Fragment : WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
         e.buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
         g_params_layout = make_layout(&e, 1);
     }
     {
-        WGPUBindGroupLayoutEntry e[4] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
-                                         WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+        WGPUBindGroupLayoutEntry e[6] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+                                         WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
         e[0].binding = 0;
         e[0].visibility = WGPUShaderStage_Fragment;
         e[0].texture.sampleType = WGPUTextureSampleType_Float;
@@ -1433,7 +1439,8 @@ bool init(const Context &ctx) {
             e[k].visibility = WGPUShaderStage_Fragment;
             e[k].sampler.type = WGPUSamplerBindingType_Filtering;
         }
-        g_tex_layout = make_layout(e, 4);
+        for (u32 k = 4; k < 6; ++k) e[k] = e[0], e[k].binding = k;
+        g_tex_layout = make_layout(e, 6);
     }
     {
         WGPUBindGroupLayoutEntry e = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
@@ -1445,7 +1452,7 @@ bool init(const Context &ctx) {
         WGPUBindGroupLayoutEntry z = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
         z.binding = 0;
         z.visibility = WGPUShaderStage_Compute;
-        z.texture.sampleType = WGPUTextureSampleType_Depth;
+        z.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;  // hwr_sync.wgsl reads it as texture_2d<f32> (OpenGL)
         z.texture.viewDimension = WGPUTextureViewDimension_2D;
         g_depth_layout = make_layout(&z, 1);
         WGPUBindGroupLayoutEntry l = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;

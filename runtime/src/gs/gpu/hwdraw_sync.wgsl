@@ -5,7 +5,7 @@
 
 @group(1) @binding(0) var color_out: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(0) var color_in: texture_2d<f32>;
-@group(1) @binding(0) var depth_in: texture_depth_2d;
+@group(1) @binding(0) var depth_in: texture_2d<f32>;  // Depth32Float read as unfilterable float (GLSL has no load from depth textures)
 
 @compute @workgroup_size(8, 8)
 fn hw_load(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -42,7 +42,7 @@ fn hw_store_z(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let x = prm(1u) + gid.x;
     let y = prm(2u) + gid.y;
-    let d = textureLoad(depth_in, vec2<i32>(i32(x), i32(y)), 0);
+    let d = textureLoad(depth_in, vec2<i32>(i32(x), i32(y)), 0).x;
     store(addr(fmt_at(prm(0u) + 35u), x, y), 0u, u32(clamp(d * 16777216.0, 0.0, 16777215.0)));
 }
 

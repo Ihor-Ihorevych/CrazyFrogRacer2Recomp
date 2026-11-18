@@ -125,6 +125,7 @@ std::uint32_t g_sharp_2d = 1;
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
 bool g_timestamps = false;
+bool g_gl = false;  // the adapter runs on OpenGL / OpenGL ES: wgpu serializes every call on one GL context (no pipelines built on a second thread)
 std::uint32_t g_vendor_id = 0;  // PCI vendor id of the chosen adapter (0x8086 Intel), 0 when unknown
 WGPUQuerySet g_queries = nullptr;
 WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
@@ -4151,7 +4152,9 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
     if (wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
         selected_dx12 = info.backendType == WGPUBackendType_D3D12;
         g_vendor_id = info.vendorID;
-        const char *api = info.backendType == WGPUBackendType_Vulkan ? "Vulkan" : info.backendType == WGPUBackendType_D3D12 ? "Direct3D 12" : info.backendType == WGPUBackendType_Metal ? "Metal" : "other";
+        g_gl = info.backendType == WGPUBackendType_OpenGLES || info.backendType == WGPUBackendType_OpenGL;
+        const char *api = info.backendType == WGPUBackendType_Vulkan ? "Vulkan" : info.backendType == WGPUBackendType_D3D12 ? "Direct3D 12" : info.backendType == WGPUBackendType_Metal ? "Metal" :
+                          info.backendType == WGPUBackendType_OpenGLES ? "OpenGL ES" : info.backendType == WGPUBackendType_OpenGL ? "OpenGL" : "other";
         const bool software = info.adapterType == WGPUAdapterType_CPU;
         if (software && !software_ok)
             std::fprintf(stderr, "[gpu] %s has only a software adapter (%.*s): looking for a real graphics chip on another API first\n", name, static_cast<int>(info.device.length), info.device.data);
@@ -4232,14 +4235,20 @@ bool init(Mode m) {
 #ifdef __EMSCRIPTEN__
     order.push_back({0, "WebGPU"});
 #else
-    // PS2_GPU_BACKEND=vulkan, dx12 or d3d12 (any letter case) picks the graphics API and nothing else is tried. Another value is said so
+    // PS2_GPU_BACKEND=vulkan, dx12, d3d12 or gl/gles/opengl (any letter case) picks the graphics API and nothing else is tried. Another value is said so
     // and ignored. Unset: Windows tries Direct3D 12 first and Vulkan if that cannot start (docs/speed.md: on the Intel laptop Direct3D 12
     // draws the same pictures 18 to 52 % faster than Vulkan); elsewhere wgpu picks. The log line "[gpu] ... on <API>" names the API used.
     if (std::string backend = os::env("PS2_GPU_BACKEND"); !backend.empty()) {
         for (char &c : backend) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         if (backend == "vulkan") order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"}), forced = true;
         else if (backend == "dx12" || backend == "d3d12") order.push_back({WGPUInstanceBackend_DX12, "Direct3D 12"}), forced = true;
-        else std::fprintf(stderr, "[gpu] PS2_GPU_BACKEND=%s is not vulkan, dx12 or d3d12: ignored\n", os::env("PS2_GPU_BACKEND").c_str());
+        else if (backend == "gl" || backend == "gles" || backend == "opengl") {
+            order.push_back({WGPUInstanceBackend_GL, "OpenGL"}), forced = true;
+#ifdef __ANDROID__
+            order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"});  // the app's default is OpenGL ES: a phone without OpenGL ES 3.1 still starts
+#endif
+        }
+        else std::fprintf(stderr, "[gpu] PS2_GPU_BACKEND=%s is not vulkan, dx12, d3d12 or gl: ignored\n", os::env("PS2_GPU_BACKEND").c_str());
     }
     if (order.empty()) {
 #ifdef _WIN32
@@ -4251,6 +4260,10 @@ bool init(Mode m) {
             order.push_back({WGPUInstanceBackend_DX12, "Direct3D 12"});
             order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"});
         }
+#elif defined(__ANDROID__)
+        // Vulkan first; a phone without a working Vulkan driver gets OpenGL ES 3.1+ instead (PS2_GPU_BACKEND=gl asks for it directly)
+        order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"});
+        order.push_back({WGPUInstanceBackend_GL, "OpenGL ES"});
 #else
         order.push_back({WGPUInstanceBackend_Primary, "the best API"});
 #endif
@@ -4281,7 +4294,12 @@ bool init(Mode m) {
     }
     if (!chosen) return false;
     if (forced) std::fprintf(stderr, "[gpu] graphics API: %s (asked for by PS2_GPU_BACKEND)\n", chosen->name);
-    else if (chosen == &order[0] && order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (the default on Windows%s; PS2_GPU_BACKEND=vulkan or dx12 picks)\n", chosen->name,
+    else if (chosen == &order[0] && order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (the default on %s%s; PS2_GPU_BACKEND=vulkan, dx12 or gl picks)\n", chosen->name,
+#ifdef _WIN32
+                 "Windows",
+#else
+                 "Android",
+#endif
                  hw::enabled() ? " with PS2_GPU_HW=1" :
                  "");
     else if (order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (%s could not be used, see above)\n", chosen->name, order[0].name);
@@ -4471,7 +4489,9 @@ bool init(Mode m) {
         release_module();
     };
 #ifndef __EMSCRIPTEN__
-    if (has_mip) {
+    // on OpenGL the thread would wait for the one GL context while the plain programs compile, and wgpu gives up on such a wait after 1 s
+    // (WGL) with a panic: the mipmap program is built after them there, as in the browser build
+    if (has_mip && !g_gl) {
         g_raster_mip_ready.store(false, std::memory_order_release);
         g_raster_mip_thread = new std::thread(build_mip);
     }
@@ -4483,6 +4503,8 @@ bool init(Mode m) {
     std::fprintf(stderr, "[gpu] %d shaders compiled in %.0f ms\n", kPipelines, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count());
 #ifdef __EMSCRIPTEN__
     if (has_mip) build_mip();  // the browser build has no threads
+#else
+    if (has_mip && g_gl) build_mip();
 #endif
     release_module();
     ensure_capacity();
@@ -4493,7 +4515,7 @@ bool init(Mode m) {
     if (hwr::requested() && !g_live) {  // PS2_RENDERER=hw: the hardware renderer draws (hwr.cpp), its targets at PS2_SCALE
         const hwr::Context hc{g_device, g_queue, g_decoded, static_cast<std::uint64_t>(kCachedWords) + kDecodedWords, g_layout, &g_group, kParamStride, kGsShader, g_swizzle.data(),
                               wgpuDeviceHasFeature(g_device, WGPUFeatureName_DualSourceBlending) != 0, hwr_position, hwr_decode, hwr_params, fmt_words, hwr_submit, g_scale,
-                              static_cast<float>(std::atof(os::env("PS2_HWR_SCALE").c_str()))};
+                              static_cast<float>(std::atof(os::env("PS2_HWR_SCALE").c_str())), g_gl};
         if (!hwr::init(hc)) std::fprintf(stderr, "[hwr] the hardware renderer could not start, the exact renderer draws\n");
     }
     g_mode = m;

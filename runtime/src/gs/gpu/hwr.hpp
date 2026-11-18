@@ -36,6 +36,7 @@ struct Context {
     void (*submit_now)();              // ends the current submit (all queued work goes to the card)
     std::uint32_t scale = 1;           // PS2_SCALE: graphics memory keeps scale^2 samples per word
     float target_scale = 0.0f;         // PS2_HWR_SCALE: card texels per GS pixel of the targets (any size, e.g. 1.35); 0 = scale
+    bool gl = false;                   // OpenGL (ES): no storage buffers in vertex shaders (Mali); the fragment stage reads the draw records (hwr.wgsl vs_gl)
 };
 
 bool requested();  // PS2_RENDERER=hw

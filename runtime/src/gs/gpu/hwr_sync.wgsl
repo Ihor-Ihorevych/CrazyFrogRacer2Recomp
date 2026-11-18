@@ -9,7 +9,7 @@
 
 @group(1) @binding(0) var hwr_out: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(0) var hwr_in: texture_2d<f32>;
-@group(1) @binding(0) var hwr_depth: texture_depth_2d;
+@group(1) @binding(0) var hwr_depth: texture_2d<f32>;  // a Depth32Float target read as unfilterable float (GLSL has no load from depth textures)
 
 fn hwr_16bit(psm: u32) -> bool {
     return psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au;
@@ -82,7 +82,7 @@ fn hwr_store_z(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = prm(3u) + gid.x / SCALE;
     let y = prm(4u) + gid.y / SCALE;
     let k = (gid.y % SCALE) * SCALE + gid.x % SCALE;
-    let d = textureLoad(hwr_depth, hwr_texel(gid, textureDimensions(hwr_depth)), 0);
+    let d = textureLoad(hwr_depth, hwr_texel(gid, textureDimensions(hwr_depth)), 0).x;
     let scale = bitcast<f32>(prm(7u));
     write_sample(prm(2u), prm(0u), prm(1u), x, y, k, u32(clamp(floor(d * scale + 0.5), 0.0, scale - 1.0)));
 }

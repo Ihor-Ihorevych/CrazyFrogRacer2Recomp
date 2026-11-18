@@ -2142,7 +2142,7 @@ bool build_layouts(Context &c) {
     sl.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
     sl.texture.viewDimension = WGPUTextureViewDimension_2D;
     G.store_layout = make_layout(c, {sl});
-    sl.texture.sampleType = WGPUTextureSampleType_Depth;
+    sl.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;  // hwdraw_sync.wgsl reads it as texture_2d<f32> (OpenGL)
     G.store_z_layout = make_layout(c, {sl});
     const auto pipeline_layout = [&](std::initializer_list<WGPUBindGroupLayout> ls) {
         std::vector<WGPUBindGroupLayout> v(ls);

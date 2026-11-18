@@ -1883,11 +1883,27 @@ bool open_window(bool fullscreen) {
 #endif
 #ifdef __ANDROID__
     // wgpu makes a Vulkan surface on SDL's native window: a Vulkan window keeps SDL itself from putting an EGL surface on it
-    if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_VULKAN;
+    // (PS2_GPU_BACKEND=gl: no Vulkan window, which SDL refuses on a phone without Vulkan; the "external context" hint keeps SDL's own EGL
+    // surface off the window, so that wgpu's OpenGL ES backend can put its EGL surface there)
+    std::string gl_backend = ps2::os::env("PS2_GPU_BACKEND");
+    for (char &c : gl_backend) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const bool want_gl = gl_backend == "gl" || gl_backend == "gles" || gl_backend == "opengl";
+    if (!std::getenv("PS2_SDL_RENDERER")) {
+        if (want_gl) SDL_SetHint(SDL_HINT_VIDEO_EXTERNAL_CONTEXT, "1");
+        else flags |= SDL_WINDOW_VULKAN;
+    }
 #endif
     g_game_title = ps2::os::env("PS2_WINDOW_TITLE");
     const std::string initial_title = g_game_title.empty() ? g_speed_title : g_game_title + "   |   " + g_speed_title;
     g_window = SDL_CreateWindow(initial_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
+#ifdef __ANDROID__
+    if (!g_window && (flags & SDL_WINDOW_VULKAN)) {  // no Vulkan on this phone: a plain window, and wgpu falls back to OpenGL ES (gpu.cpp init)
+        std::fprintf(stderr, "SDL: %s: trying OpenGL ES\n", SDL_GetError());
+        SDL_SetHint(SDL_HINT_VIDEO_EXTERNAL_CONTEXT, "1");
+        flags &= ~static_cast<Uint32>(SDL_WINDOW_VULKAN);
+        g_window = SDL_CreateWindow(initial_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
+    }
+#endif
     if (!g_window) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;

@@ -187,6 +187,22 @@ public class SettingsPanel extends FrameLayout {
         restartNote.setVisibility(View.GONE);
         updateResolution(current);
 
+        box.addView(text("Graphics API", 14, TEXT, false), margin(wrap(), 0, 10, 0, 0));
+        final Segmented api = new Segmented(ctx, "OpenGL ES", "Vulkan");
+        final boolean startGles = st.gles();
+        api.setSelected(startGles ? 0 : 1);
+        final TextView apiAgain = text("Restart the game to apply this. Tap here to restart now.", 12, ACCENT, true);
+        apiAgain.setOnClickListener(v -> host.restartGame());
+        api.setListener(index -> {
+            st.put("gles", index == 0);
+            apiAgain.setVisibility((index == 0) == startGles ? View.GONE : View.VISIBLE);
+        });
+        box.addView(api, margin(wrap(), 0, 6, 0, 0));
+        box.addView(text("OpenGL ES works on most phones. Vulkan can be faster on newer phones: try it if the game is slow.", 12, DIM, false),
+                    margin(wrap(), 0, 8, 0, 0));
+        box.addView(apiAgain, margin(wrap(), 0, 4, 0, 0));
+        apiAgain.setVisibility(View.GONE);
+
         box.addView(text("FPS counter", 14, TEXT, false), margin(wrap(), 0, 10, 0, 0));
         Segmented fps = new Segmented(ctx, "Shown", "Hidden");
         fps.setSelected(st.fps() ? 0 : 1);

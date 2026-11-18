@@ -31,7 +31,7 @@ public class SpikeActivity extends SDLActivity implements SettingsPanel.Host {
             // there is no compiler on a phone: code the build did not translate stops the game instead
             Os.setenv("PS2_EE_LIVE", "0", true);
             Os.setenv("PS2_VU_LIVE", "0", true);
-            Os.setenv("PS2_GPU_BACKEND", "vulkan", true);
+            // PS2_GPU_BACKEND comes from the settings (Settings.exportEnv: Vulkan, or OpenGL ES)
             // the hardware renderer (docs/hw-renderer-design.md, M2) draws by default; PS2_RENDERER=exact in env.txt (read below) brings the exact one back
             Os.setenv("PS2_RENDERER", "hw", true);
             // debug hook: extra KEY=VALUE lines from files/env.txt (runtime switches to try without a rebuild)

@@ -21,6 +21,9 @@ struct D {
 @group(1) @binding(1) var smp: sampler;
 @group(1) @binding(2) var smp_clamp: sampler;   // bilinear, clamp to edge
 @group(1) @binding(3) var smp_repeat: sampler;  // bilinear, repeat
+// the same view as tex again, once per sampler: GLSL (OpenGL backend) pairs each texture with one sampler
+@group(1) @binding(4) var tex_clamp: texture_2d<f32>;
+@group(1) @binding(5) var tex_repeat: texture_2d<f32>;
 
 override TEX: u32 = 0u;
 override ATEST: u32 = 0u;
@@ -72,6 +75,32 @@ fn vs(v: VIn) -> VOut {
     o.stq = v.stq;
     o.fog = v.fog;
     let d = draws[v.di];
+    o.da = d.a;
+    o.db = d.b;
+    o.dc = d.c;
+    o.dd = d.d.x;
+    return o;
+}
+
+// OpenGL ES (Mali: no storage buffers in vertex shaders, hwr.cpp C.gl): the vertex stage passes only the record's index (in da.x) and the
+// fragment stage reads the record (with_draw)
+@vertex
+fn vs_gl(v: VIn) -> VOut {
+    var o: VOut;
+    o.pos = vec4<f32>(v.pos, v.z, 1.0);
+    o.col = v.col;
+    o.stq = v.stq;
+    o.fog = v.fog;
+    o.da = vec4<u32>(v.di, 0u, 0u, 0u);
+    o.db = vec4<u32>(0u);
+    o.dc = vec4<u32>(0u);
+    o.dd = 0u;
+    return o;
+}
+
+fn with_draw(in: VOut) -> VOut {
+    var o = in;
+    let d = draws[in.da.x];
     o.da = d.a;
     o.db = d.b;
     o.dc = d.c;
@@ -160,9 +189,9 @@ fn sample_loads(d: D, u: f32, v: f32) -> vec4<f32> {
             let at = vec2<f32>(u * fx, v * fy) / dim;
             var c: vec4<f32>;
             if (mu == 0u) {
-                c = textureSampleLevel(tex, smp_repeat, at, 0.0);
+                c = textureSampleLevel(tex_repeat, smp_repeat, at, 0.0);
             } else {
-                c = textureSampleLevel(tex, smp_clamp, at, 0.0);
+                c = textureSampleLevel(tex_clamp, smp_clamp, at, 0.0);
             }
             return floor(c * 255.0 + vec4<f32>(0.5));
         }
@@ -359,14 +388,23 @@ fn shade(in: VOut) -> Shaded {
     return s;
 }
 
-@fragment
-fn fs(in: VOut) -> @location(0) vec4<f32> {
+fn plain_out(in: VOut) -> vec4<f32> {
     let s = shade(in);
     var oa = s.alpha / 255.0;
     if ((in.da.x & F_ALPHA_FACTOR) != 0u) {
         oa = s.factor;
     }
     return vec4<f32>(s.rgb / 255.0, oa);
+}
+
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    return plain_out(in);
+}
+
+@fragment
+fn fs_gl(in: VOut) -> @location(0) vec4<f32> {
+    return plain_out(with_draw(in));
 }
 
 //DUAL_BEGIN
@@ -377,12 +415,21 @@ struct DualOut {
     @location(0) @blend_src(1) f: vec4<f32>,
 }
 
-@fragment
-fn fs_dual(in: VOut) -> DualOut {
+fn dual_out(in: VOut) -> DualOut {
     let s = shade(in);
     var o: DualOut;
     o.c = vec4<f32>(s.rgb / 255.0, s.alpha / 255.0);
     o.f = vec4<f32>(s.factor, s.factor, s.factor, 1.0);
     return o;
+}
+
+@fragment
+fn fs_dual(in: VOut) -> DualOut {
+    return dual_out(in);
+}
+
+@fragment
+fn fs_dual_gl(in: VOut) -> DualOut {
+    return dual_out(with_draw(in));
 }
 //DUAL_END
