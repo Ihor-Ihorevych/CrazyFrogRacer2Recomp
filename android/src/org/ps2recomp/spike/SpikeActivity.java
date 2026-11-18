@@ -113,7 +113,13 @@ public class SpikeActivity extends SDLActivity implements SettingsPanel.Host {
     @Override
     protected String[] getArguments() {
         String dir = getExternalFilesDir(null).getAbsolutePath();
-        java.util.ArrayList<String> args = new java.util.ArrayList<>(java.util.Arrays.asList("--disc", dir + "/disc.iso", "--window", "--memcard", dir + "/mc.ps2"));
+        // the self-contained build carries the disc as an uncompressed asset: the runtime reads it in place ("<apk>@<offset>+<size>"),
+        // and the game's folder (saves, recorded programs) stays the app folder
+        String disc = dir + "/disc.iso";
+        try (android.content.res.AssetFileDescriptor fd = getAssets().openFd("disc.iso")) {
+            disc = getApplicationInfo().sourceDir + "@" + fd.getStartOffset() + "+" + fd.getLength();
+        } catch (Exception e) { /* no disc inside: the one in the app folder */ }
+        java.util.ArrayList<String> args = new java.util.ArrayList<>(java.util.Arrays.asList("--disc", disc, "--game-dir", dir, "--window", "--memcard", dir + "/mc.ps2"));
         // debug: a race.state in the app folder is loaded at start, so every test starts in the same place (quick save F5 files work too)
         java.io.File race = new java.io.File(dir, "race.state");
         if (race.exists()) {

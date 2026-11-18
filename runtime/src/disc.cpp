@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -118,13 +119,33 @@ bool open(const std::string &path) {
         }
         return true;
     }
-    std::FILE *file = os::open(path, "rb");
+    // "<file>@<offset>+<size>" (decimal): the image is that part of another file, e.g. an uncompressed asset inside the Android
+    // app's own APK (the self-contained build). Taken only when the whole string is not a file itself.
+    std::string base = path;
+    std::uint64_t slice_at = 0, slice_size = 0;
+    if (std::FILE *probe_file = os::open(path, "rb")) {
+        std::fclose(probe_file);
+    } else if (const std::size_t at = path.rfind('@'), plus = path.rfind('+'); at != std::string::npos && plus != std::string::npos && plus > at + 1) {
+        char *e1 = nullptr, *e2 = nullptr;
+        const unsigned long long o = std::strtoull(path.c_str() + at + 1, &e1, 10), n = std::strtoull(path.c_str() + plus + 1, &e2, 10);
+        if (e1 == path.c_str() + plus && e2 && *e2 == 0 && n > 0) base = path.substr(0, at), slice_at = o, slice_size = n;
+    }
+    std::FILE *file = os::open(base, "rb");
     if (!file) return false;
 #if defined(_WIN32)
-    const long long end = _fseeki64(file, 0, SEEK_END) == 0 ? _ftelli64(file) : -1;
+    long long end = _fseeki64(file, 0, SEEK_END) == 0 ? _ftelli64(file) : -1;
 #else
-    const long long end = fseeko(file, 0, SEEK_END) == 0 ? static_cast<long long>(ftello(file)) : -1;
+    long long end = fseeko(file, 0, SEEK_END) == 0 ? static_cast<long long>(ftello(file)) : -1;
 #endif
+    if (slice_size) {
+        if (end < 0 || slice_at + slice_size > static_cast<std::uint64_t>(end)) {
+            std::fprintf(stderr, "[disc] %s: the part %llu+%llu lies outside the file\n", base.c_str(), static_cast<unsigned long long>(slice_at), static_cast<unsigned long long>(slice_size));
+            std::fclose(file);
+            return false;
+        }
+        end = static_cast<long long>(slice_size);
+        std::fprintf(stderr, "[disc] the image is %llu bytes at %llu inside %s\n", static_cast<unsigned long long>(slice_size), static_cast<unsigned long long>(slice_at), base.c_str());
+    }
     if (end < 0) {
         std::fprintf(stderr, "[disc] %s: cannot find the size of the image\n", path.c_str());
         std::fclose(file);
@@ -134,7 +155,8 @@ bool open(const std::string &path) {
     // leaked nor kept locked.
     std::FILE *previous = g_file;
     g_file = file;
-    const bool opened = open(path, static_cast<std::uint64_t>(end), [file](std::uint64_t offset, void *out, std::size_t bytes) -> std::size_t {
+    const bool opened = open(path, static_cast<std::uint64_t>(end), [file, slice_at](std::uint64_t offset, void *out, std::size_t bytes) -> std::size_t {
+        offset += slice_at;
         // A failed seek reads nothing (read() then says "short read") instead of the sectors at the old position.
 #if defined(_WIN32)
         if (_fseeki64(file, static_cast<long long>(offset), SEEK_SET) != 0) return 0;
