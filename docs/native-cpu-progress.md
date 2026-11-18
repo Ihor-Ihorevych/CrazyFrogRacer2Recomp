@@ -43,6 +43,30 @@ phone's kind of code).
 - **ARM flush-to-zero instead of the eager vfix**: FPCR.FZ decides tininess before rounding, vfix after; a product that rounds up to
   the smallest normal number would differ. Not bit-exact, not done.
 
+## Second round: the parts that were still emulated
+
+Checks as above, plus a power-on run of 3000 frames with no input (intro movies through the IPU: 81 M qwords decoded, title),
+pictures every 100 frames and the end state, all byte-identical to the build before.
+
+| What | Where | Check |
+|---|---|---|
+| EE FPU `div`: the float unit's division when both operands and the quotient are ordinary numbers (rounded once to nearest, which is divide()'s answer); everything else the old way | runtime/include/ps2/fpu.hpp (`fp::ee::div`) | a billion random and edge pairs vs the old code |
+| EE `cvt.w.s` / `cvt.s.w` with the float unit's conversions (cut towards zero) | fpu.hpp (`fp::cvt_w_s`, `fp::cvt_s_w`) | all 2^32 inputs each |
+| IPU (movies) on ARM: IDCT and colour conversion with clang vector types, the AVX2 versions' arithmetic in the same order (ARM had the plain loops) | runtime/src/ipu/idct.cpp, ipu.cpp (`-DPS2_IPU_PORTABLE` uses them on x86 too) | 3 M IDCT blocks and 2 M macroblocks (RGB32 and RGB16) vs the plain code; the power-on run with `-DPS2_IPU_PORTABLE -DPS2_VU_NO_DAZ` |
+| SPU2 voice loop: the routing bits read once per voice instead of once per sample (the compiler reloaded them after every store into the mix) | runtime/src/iop/spu2.cpp | race, replay, power-on |
+
+Speed of the float helpers on the PC (one long dependent chain, random ordinary numbers): div 9.8 -> 4.6 ns, cvt.s.w 0.35 -> 0.10 ns,
+cvt.w.s 0.35 -> 0.15 ns. A float-unit `mul` (6.5 vs 4.3 ns) and `sqrt` (4.9 vs 4.4 ns) were slower and `add`/`sub` the same
+(9.7-10.2 vs 10.7 ns), so those stay integer code (fast versions in C:/Users/Ihor/CFR2Recomp/nat/fp/fast.hpp, all exact).
+
+**IOP translated ahead of time: tried, measured, removed.** Every block the interpreter forms (6211 blocks recorded over race,
+replay and power-on) was translated into a C++ function doing the same operations, stopping before any instruction the block code
+would give up; all three runs stayed byte-identical. But the IOP's time did not change (PS2_IOP_LOAD: 0.24-0.27 ms per frame either
+way). Counting showed why: the IOP runs ~6.5 k blocks of ~6 instructions per frame and spends ~38 ns per block in the interpreter's
+bookkeeping (block lookup, successor cache, entry), which a per-block function keeps; instruction dispatch was never the cost.
+(Almost every block entry also re-checks its words, as the epoch goes up after every hardware access, but that is ~36 k words per
+frame, a few microseconds.) Only a whole recompiler with direct jumps between blocks could win, at most ~0.2 ms per PC frame.
+
 ## Phone
 
 `android-spike/CrazyFrogRacer2-full.apk` (disc inside) built and installed 2026-11-18; the build before is kept in

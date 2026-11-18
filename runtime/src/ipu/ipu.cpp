@@ -460,7 +460,8 @@ void convert_block(const std::uint8_t *raw, std::uint8_t *dst) {
     }
 }
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) && !defined(PS2_IPU_PORTABLE)
+#define PS2_IPU_CONVERT 1
 // The same conversion eight pixels at a time (integer arithmetic only, so the same values in every pixel, checked against the plain
 // version above on random macroblocks and thresholds). One row of 16 pixels is two vectors; the chroma terms are shared by two pixels.
 template <bool Rgb16>
@@ -511,12 +512,58 @@ void convert_block_avx2(const std::uint8_t *raw, std::uint8_t *dst) {
 }
 #endif
 
+#if !defined(PS2_IPU_CONVERT) && defined(__clang__)
+#define PS2_IPU_CONVERT 2
+// The AVX2 conversion with clang's vector types (NEON on ARM): integer arithmetic only, eight pixels at a time, the same values as
+// convert_block in every pixel.
+typedef int IpuI8 __attribute__((ext_vector_type(8)));
+typedef std::uint8_t IpuU8x8 __attribute__((ext_vector_type(8)));
+typedef std::uint16_t IpuU16x8 __attribute__((ext_vector_type(8)));
+typedef std::uint32_t IpuU32x8 __attribute__((ext_vector_type(8)));
+template <bool Rgb16>
+void convert_block_vec(const std::uint8_t *raw, std::uint8_t *dst) {
+    const IpuI8 th0 = static_cast<int>(g_th0), th1 = static_cast<int>(g_th1);
+    const auto bytes = [](const std::uint8_t *p) {
+        IpuU8x8 b;
+        std::memcpy(&b, p, 8);
+        return __builtin_convertvector(b, IpuI8);
+    };
+    for (int y = 0; y < 16; ++y) {
+        const std::uint8_t *luma = raw + y * 16;
+        const IpuI8 cb8 = bytes(raw + 256 + (y / 2) * 8) - 128, cr8 = bytes(raw + 320 + (y / 2) * 8) - 128;
+        for (int half = 0; half < 2; ++half) {
+            const IpuI8 cb = half ? __builtin_shufflevector(cb8, cb8, 4, 4, 5, 5, 6, 6, 7, 7) : __builtin_shufflevector(cb8, cb8, 0, 0, 1, 1, 2, 2, 3, 3);
+            const IpuI8 cr = half ? __builtin_shufflevector(cr8, cr8, 4, 4, 5, 5, 6, 6, 7, 7) : __builtin_shufflevector(cr8, cr8, 0, 0, 1, 1, 2, 2, 3, 3);
+            const IpuI8 add_r = cr * 204 + 64, add_g = cb * -50 + cr * -104 + 64, add_b = cb * 258 + 64;
+            const IpuI8 lum = __builtin_elementwise_max(bytes(luma + half * 8) - 16, (IpuI8)0) * 149;
+            const IpuI8 r = __builtin_elementwise_min(__builtin_elementwise_max((lum + add_r) >> 7, (IpuI8)0), (IpuI8)255);
+            const IpuI8 g = __builtin_elementwise_min(__builtin_elementwise_max((lum + add_g) >> 7, (IpuI8)0), (IpuI8)255);
+            const IpuI8 b = __builtin_elementwise_min(__builtin_elementwise_max((lum + add_b) >> 7, (IpuI8)0), (IpuI8)255);
+            const IpuI8 below0 = (r < th0) & (g < th0) & (b < th0), below1 = (r < th1) & (g < th1) & (b < th1);
+            const IpuI8 a = ~below0 & ((below1 & 0x40) | (~below1 & 0x80));
+            if constexpr (Rgb16) {
+                const IpuU16x8 p = __builtin_convertvector((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a & 0x80) << 8), IpuU16x8);
+                std::memcpy(dst, &p, 16);
+                dst += 16;
+            } else {
+                const IpuU32x8 p = (IpuU32x8)(r | (g << 8) | (b << 16) | (a << 24));
+                std::memcpy(dst, &p, 32);
+                dst += 32;
+            }
+        }
+    }
+}
+#endif
+
 void convert(const std::uint8_t *raw, bool rgb16) {
     const std::size_t at = g_out.size();
     g_out.resize(at + (rgb16 ? 512 : 1024));
-#if defined(__AVX2__)
+#if PS2_IPU_CONVERT == 1
     if (rgb16) convert_block_avx2<true>(raw, g_out.data() + at);
     else convert_block_avx2<false>(raw, g_out.data() + at);
+#elif PS2_IPU_CONVERT == 2
+    if (rgb16) convert_block_vec<true>(raw, g_out.data() + at);
+    else convert_block_vec<false>(raw, g_out.data() + at);
 #else
     if (rgb16) convert_block<true>(raw, g_out.data() + at);
     else convert_block<false>(raw, g_out.data() + at);

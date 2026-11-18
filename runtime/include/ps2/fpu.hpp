@@ -159,8 +159,20 @@ inline std::uint32_t from_fixed(std::int32_t v, int fraction) {
     return from_double(static_cast<double>(v) / static_cast<double>(1u << fraction));
 }
 
-inline std::uint32_t cvt_w_s(std::uint32_t x) { return to_fixed(x, 0); }
-inline std::uint32_t cvt_s_w(std::uint32_t v) { return from_fixed(static_cast<std::int32_t>(v), 0); }
+// to_fixed(x, 0): below one gives 0, from 2^31 up the largest number of the sign, everything between is the float cut towards zero,
+// which the float unit's own conversion does. The same as to_fixed on every one of the 2^32 inputs.
+inline std::uint32_t cvt_w_s(std::uint32_t x) {
+    const std::uint32_t e = exponent(x);
+    if (e <= 126u) return 0;
+    if (e >= 158u) return (x & kSign) ? 0x80000000u : 0x7FFFFFFFu;
+    return static_cast<std::uint32_t>(static_cast<std::int32_t>(std::bit_cast<float>(x)));
+}
+// from_fixed(v, 0): the integer as a double (exact), cut to 24 bits as from_double cuts (towards zero), then a float (exact now).
+// The same as from_fixed on every one of the 2^32 inputs.
+inline std::uint32_t cvt_s_w(std::uint32_t v) {
+    const std::uint64_t bits = std::bit_cast<std::uint64_t>(static_cast<double>(static_cast<std::int32_t>(v))) & 0xFFFFFFFFE0000000ull;
+    return std::bit_cast<std::uint32_t>(static_cast<float>(std::bit_cast<double>(bits)));
+}
 
 // The Emotion Engine's own FPU (COP1), as the hardware tests show it. The functions above are shared with the vector
 // units, whose arithmetic differs in the last bit and in the flags, so they stay as they are. Here:
@@ -287,6 +299,13 @@ inline std::uint32_t divide(std::uint32_t &fcr, std::uint32_t a, std::uint32_t b
 }
 
 inline std::uint32_t div(std::uint32_t &fcr, std::uint32_t a, std::uint32_t b) {
+    // Two ordinary numbers (exponent 1..254) whose quotient is an ordinary number above the smallest one: the float unit's division,
+    // rounded once to nearest, is divide()'s answer. Everything else (a zero, a denormal, an exponent of 255, an overflow, a quotient
+    // that may have rounded up to 2^-126) takes the way below. Checked against it on a billion random and edge pairs.
+    if (exponent(a) - 1u < 254u && exponent(b) - 1u < 254u) [[likely]] {
+        const std::uint32_t q = std::bit_cast<std::uint32_t>(std::bit_cast<float>(a) / std::bit_cast<float>(b)), m = q & kAbs;
+        if (m > 0x00800000u && m < 0x7F800000u) return q;
+    }
     a = flush(a);
     b = flush(b);
     const std::uint32_t sign = (a ^ b) & kSign;

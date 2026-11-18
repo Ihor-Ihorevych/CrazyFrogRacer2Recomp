@@ -368,6 +368,8 @@ void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (
     const std::uint32_t step = std::min<std::uint32_t>(v.pitch, 0x3FFFu);
     const bool sweep_l = v.voll & 0x8000u, sweep_r = v.volr & 0x8000u;
     const std::int32_t fixed_l = static_cast<std::int16_t>(v.voll << 1), fixed_r = static_cast<std::int16_t>(v.volr << 1);
+    // where this voice goes, read once: in the loop the compiler would read the routing again after every store into dry/wet
+    const bool to_dry_l = route.dry[0] & bit, to_dry_r = route.dry[1] & bit, to_wet_l = route.wet[0] & bit, to_wet_r = route.wet[1] & bit;
     std::uint32_t position = v.position;
     for (unsigned n = 0; n < kBatch; ++n) {
         if (v.phase == kOff) break;
@@ -396,10 +398,10 @@ void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (
         // the volume sweeps step once per sample whatever the voice is sent to
         const std::int32_t l = out * (sweep_l ? volume(v.voll, v.vol[0]) : fixed_l) >> 15;
         const std::int32_t r = out * (sweep_r ? volume(v.volr, v.vol[1]) : fixed_r) >> 15;
-        if (route.dry[0] & bit) dry[n][0] += l;
-        if (route.dry[1] & bit) dry[n][1] += r;
-        if (route.wet[0] & bit) wet[n][0] += l;
-        if (route.wet[1] & bit) wet[n][1] += r;
+        if (to_dry_l) dry[n][0] += l;
+        if (to_dry_r) dry[n][1] += r;
+        if (to_wet_l) wet[n][0] += l;
+        if (to_wet_r) wet[n][1] += r;
     }
     v.position = position;
 }

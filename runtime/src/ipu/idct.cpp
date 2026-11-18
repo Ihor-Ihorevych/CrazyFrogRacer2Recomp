@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cmath>
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) && !defined(PS2_IPU_PORTABLE)
+#define PS2_IDCT_AVX2 1
 #include <immintrin.h>
 #endif
+#include <cstring>
 
 namespace ps2::ipu {
 
@@ -66,7 +68,7 @@ void idct_plain(const int *in, std::int16_t *out) {
     }
 }
 
-#if defined(__AVX2__)
+#if defined(PS2_IDCT_AVX2)
 
 // The same arithmetic as idct_plain, written out in AVX2: every output is the same chain of double multiplications and additions in the
 // same order (a multiplication and then an addition, never a fused one: the build uses -ffp-contract=off, and the intrinsics below are
@@ -123,6 +125,68 @@ void idct(const int *in, std::int16_t *out) {
         }
         finish(lo0, hi0, out + y * 8);
         finish(lo1, hi1, out + y * 8 + 8);
+    }
+}
+
+#elif defined(__clang__)
+
+// The AVX2 version above with clang's vector types (NEON on ARM): the same chains of double multiplications and additions in the same
+// order, each started from +0.0, then floor(x + 0.5), clamped, turned into integers. Same pixels as idct_plain for every input.
+typedef double IdctD4 __attribute__((ext_vector_type(4)));
+typedef int IdctI4 __attribute__((ext_vector_type(4)));
+
+void idct(const int *in, std::int16_t *out) {
+    const Cosines &t = tables();
+    alignas(32) double rows[8][8];
+    int live[8], live_rows = 0;
+    const auto load = [](const double *p) {
+        IdctD4 v;
+        std::memcpy(&v, p, sizeof v);
+        return v;
+    };
+    for (int v = 0; v < 8; ++v) {
+        const int *row = in + v * 8;
+        unsigned mask = 0;
+        for (int u = 0; u < 8; ++u) mask |= (row[u] != 0 ? 1u : 0u) << u;
+        if (!mask) continue;
+        live[live_rows++] = v;
+        IdctD4 lo = 0.0, hi = 0.0;
+        do {
+            const int u = __builtin_ctz(mask);
+            mask &= mask - 1;
+            const IdctD4 w = static_cast<double>(row[u]);
+            lo = lo + load(t.cosines_t[u]) * w;
+            hi = hi + load(t.cosines_t[u] + 4) * w;
+        } while (mask);
+        std::memcpy(rows[v], &lo, sizeof lo);
+        std::memcpy(rows[v] + 4, &hi, sizeof hi);
+    }
+    if (!live_rows) {
+        std::fill(out, out + 64, std::int16_t{0});
+        return;
+    }
+    const auto finish = [](IdctD4 a) {
+        a = __builtin_elementwise_min(__builtin_elementwise_max(__builtin_elementwise_floor(a + 0.5), (IdctD4)-256.0), (IdctD4)255.0);
+        return __builtin_convertvector(a, IdctI4);
+    };
+    for (int y = 0; y < 8; y += 2) {
+        IdctD4 lo0 = 0.0, hi0 = 0.0, lo1 = 0.0, hi1 = 0.0;
+        for (int k = 0; k < live_rows; ++k) {
+            const int v = live[k];
+            const IdctD4 rlo = load(rows[v]), rhi = load(rows[v] + 4);
+            const IdctD4 c0 = t.cosines[y][v], c1 = t.cosines[y + 1][v];
+            lo0 = lo0 + c0 * rlo;
+            hi0 = hi0 + c0 * rhi;
+            lo1 = lo1 + c1 * rlo;
+            hi1 = hi1 + c1 * rhi;
+        }
+        const IdctI4 a = finish(lo0), b = finish(hi0), c = finish(lo1), d = finish(hi1);
+        for (int x = 0; x < 4; ++x) {
+            out[y * 8 + x] = static_cast<std::int16_t>(a[x]);
+            out[y * 8 + 4 + x] = static_cast<std::int16_t>(b[x]);
+            out[y * 8 + 8 + x] = static_cast<std::int16_t>(c[x]);
+            out[y * 8 + 12 + x] = static_cast<std::int16_t>(d[x]);
+        }
     }
 }
 
