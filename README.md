@@ -30,6 +30,8 @@ me what to fix next, and one fix often helps several games at once.
 - **Turns your disc into a PC game:** in the app, choose the disc image, press *Build*, then *Play*. You get a program of
   its own with a desktop shortcut. The app downloads its own build tools, so nothing has to be installed.
 - **Windows and Linux**, drawing through Direct3D 12 or Vulkan.
+- **Android** (this fork, Crazy Frog Racer 2 so far): an APK you build on your PC from your own disc, with touch
+  controls, drawing through OpenGL ES or Vulkan. See [*Android*](#android-crazy-frog-racer-2).
 - **Keyboard and mouse or a game controller**, with a key card (F1) and keys you can change.
 - **Saving:** quick saves (F5 and F8) and the game's own memory card saves.
 - **A clearer picture:** sharper text and HUD, smoother edges, picture styles to switch between (F2), and twice the
@@ -200,6 +202,39 @@ You need git, clang, CMake, Ninja, Python 3, the SDL2 development files and a Vu
 prints. Checked on CachyOS with an NVIDIA graphics card.
 
 **macOS:** [n0madic](https://github.com/n0madic) is the macOS maintainer: builds and tests it on an Apple Silicon Mac and looks after Mac issues and pull requests. GitHub also builds every change on macOS.
+
+## Android: Crazy Frog Racer 2
+
+This fork ports **Crazy Frog Racer 2 (Europe, SLES-54549)** to Android phones (arm64, Android 10 or newer). Nothing is
+compiled on the phone: the game's code is translated and built on your PC from your own disc, and you install the APK.
+Nothing from the game is in this repo.
+
+**What works:** menus and races at full speed (PAL, 50 fps) on a Mali-G615 phone at the phone's own resolution,
+widescreen at the phone's shape, touch controls and sound. The game has not been played from start to end on a phone yet. The app opens a settings menu (resolution %, game view, graphics API,
+FPS counter, control layout).
+
+**How it is built** (Windows, Git Bash; the same tools as the PC build plus the Android SDK/NDK 28):
+
+1. Build the game for PC first (`scripts/port.sh cfr2 ...`), play it so the build sees all the code, then translate it
+   all (`scripts/ee_cover.sh`, into `generated/cfr2_ee_all`). The phone has no live translation, so everything it runs
+   must be translated ahead.
+2. Build wgpu-native and SDL2 for `aarch64-linux-android` (into `third_party/wgpu-native-android` and an SDL2 install).
+3. Configure and build `libmain.so`:
+   ```sh
+   cmake -G Ninja -B build/android-gpu -DCMAKE_BUILD_TYPE=Release \
+     -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+     -DPS2_GENERATED=generated/cfr2_ee_all -DPS2_WGPU_DIR=third_party/wgpu-native-android -DSDL2_DIR=<sdl2>/lib/cmake/SDL2
+   ninja -C build/android-gpu
+   ```
+4. Strip it (`llvm-strip`) into `android/libs/arm64-v8a/` with `libSDL2.so`, then `bash android/build_apk.sh` (no Gradle).
+   With `DISC=games/cfr2/disc.iso` the disc image goes into the APK (about 480 MB, self-contained).
+
+**On the phone:** a file `env.txt` in the app's external files folder (one `KEY=VALUE` per line, pushed with `adb push`)
+sets runtime switches. Useful ones: `PS2_RENDERER=exact` (the slow exact renderer instead of the default hardware one),
+`PS2_GPU_BACKEND=vulkan` or `gl`, `PS2_SPEED_LOG=1` and `PS2_PROF=1` (logs in `files/logs`).
+
+Design notes and measurements: [hardware renderer](docs/hw-renderer-design.md) ([progress](docs/hw-renderer-progress.md)),
+[native CPU paths](docs/native-cpu-progress.md), [touch control audit](android/art/audit.md).
 
 ## Playing
 
@@ -399,8 +434,8 @@ console prints. GitHub builds every change on Linux and macOS; Windows I build a
 
 ### What it stands on
 
-Drawing goes through [wgpu-native](https://github.com/gfx-rs/wgpu-native) (WebGPU), which uses Direct3D 12 or Vulkan, and Metal
-on a Mac. SDL2 gives the window, the input and the sound device. On Windows it is built with llvm-mingw (clang) instead of Visual
+Drawing goes through [wgpu-native](https://github.com/gfx-rs/wgpu-native) (WebGPU), which uses Direct3D 12 or Vulkan, Metal
+on a Mac, and OpenGL ES or Vulkan on Android. SDL2 gives the window, the input and the sound device. On Windows it is built with llvm-mingw (clang) instead of Visual
 Studio, because the code uses clang's vector features and llvm-mingw is a plain zip that the app can download by itself. The app
 runs the same build steps as the command line.
 
