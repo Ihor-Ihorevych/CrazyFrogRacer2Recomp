@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp" android:height="96dp"
+    android:viewportWidth="96" android:viewportHeight="96">
+    <path
+        android:pathData="M24,48 a24,24 0 1,0 48,0 a24,24 0 1,0 -48,0 Z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="6"
+        android:strokeLineCap="butt"
+        android:strokeLineJoin="miter"/>
+    <path
+        android:pathData="M39,48 a9,9 0 1,0 18,0 a9,9 0 1,0 -18,0 Z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="6"
+        android:strokeLineCap="butt"
+        android:strokeLineJoin="miter"/>
+    <path
+        android:pathData="M48,8 L48,24"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="12"
+        android:strokeLineCap="butt"
+        android:strokeLineJoin="miter"/>
+    <group android:rotation="45" android:pivotX="48" android:pivotY="48">
+        <path
+            android:pathData="M48,8 L48,24"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="12"
+            android:strokeLineCap="butt"
+            android:strokeLineJoin="miter"/>
+    </group>
+    <group android:rotation="90" android:pivotX="48" android:pivotY="48">
+        <path
+            android:pathData="M48,8 L48,24"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="12"
+            android:strokeLineCap="butt"
+            android:strokeLineJoin="miter"/>
+    </group>
+    <group android:rotation="135" android:pivotX="48" android:pivotY="48">
+        <path
+            android:pathData="M48,8 L48,24"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="12"
+            android:strokeLineCap="butt"
+            android:strokeLineJoin="miter"/>
+    </group>
+    <group android:rotation="180" android:pivotX="48" android:pivotY="48">
+        <path
+            android:pathData="M48,8 L48,24"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="12"
+            android:strokeLineCap="butt"
+            android:strokeLineJoin="miter"/>
+    </group>
+    <group android:rotation="225" android:pivotX="48" android:pivotY="48">
+        <path
+            android:pathData="M48,8 L48,24"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="12"
+            android:strokeLineCap="butt"
+            android:strokeLineJoin="miter"/>
+    </group>
+    <group android:rotation="270" android:pivotX="48" android:pivotY="48">
+        <path
+            android:pathData="M48,8 L48,24"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="12"
+            android:strokeLineCap="butt"
+            android:strokeLineJoin="miter"/>
+    </group>
+    <group android:rotation="315" android:pivotX="48" android:pivotY="48">
+        <path
+            android:pathData="M48,8 L48,24"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="12"
+            android:strokeLineCap="butt"
+            android:strokeLineJoin="miter"/>
+    </group>
+</vector>
