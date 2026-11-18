@@ -31,6 +31,8 @@ final class Icons {
         SvgPath.circle(8, 12, 5), 1.7f);
     // a paper plane, outlined
     static final Glyph TELEGRAM = new Glyph(null, "M21 4 L2.8 11.2 L9.3 13.4 L11.8 20 L14.9 15.6 L19.6 19.2 Z M9.3 13.4 L21 4", 1.7f);
+    // source code: </>
+    static final Glyph SOURCE = new Glyph(null, "M8 7 L3 12 L8 17 M16 7 L21 12 L16 17 M14 5 L10 19", 1.8f);
 
     /** The frog emblem's layers on its 108 x 108 tile: path data, colour, stroke width (0 fills). */
     static final Object[][] FROG = {

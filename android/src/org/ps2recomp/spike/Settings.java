@@ -18,11 +18,9 @@ public final class Settings {
     }
 
     public int display() { return p.getInt("display", DISPLAY_ORIGINAL); }      // how the picture fills the screen (live)
-    /** Internal resolution in percent of the screen's height, 25..100 in steps of 5 (needs a restart). The default is about the PS2's own. */
-    public int resPct() {
-        int def = Math.round(512f * 100f / screenLines / 5f) * 5;
-        return p.getInt("res_pct", Math.max(25, Math.min(100, def)));
-    }
+    /** Internal resolution in percent of the screen's height, 25..100 in steps of 5 (needs a restart). 40 % until the player picks one. */
+    public static final int DEFAULT_RES_PCT = 40;
+    public int resPct() { return p.getInt("res_pct", DEFAULT_RES_PCT); }
     /** Card texels per PS2 pixel for a percentage: the PS2 picture is 512 lines high; 1/16 steps. */
     public float scaleFor(int pct) {
         float f = pct / 100f * screenLines / 512f;

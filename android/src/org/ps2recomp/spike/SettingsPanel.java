@@ -32,6 +32,7 @@ public class SettingsPanel extends FrameLayout {
     }
 
     static final String TELEGRAM = "https://t.me/flipendodroid";
+    static final String SOURCE = "https://github.com/Ihor-Ihorevych/CrazyFrogRacer2Recomp";
 
     private static final int ACCENT = 0xFFE58A2E, CARD = 0xFF1C1814, SECTION = 0xFF262019, FIELD = 0xFF2E2822,
         TEXT = 0xFFF2EDE6, DIM = 0xFF9A8F84;
@@ -91,6 +92,7 @@ public class SettingsPanel extends FrameLayout {
         View spacer = new View(ctx);
         col.addView(spacer, new LinearLayout.LayoutParams(0, 0, 1f));
         col.addView(link(Icons.TELEGRAM, "Telegram group", TELEGRAM), match());
+        col.addView(link(Icons.SOURCE, "Source code (GitHub)", SOURCE), margin(match(), 0, 8, 0, 0));
         return col;
     }
 
