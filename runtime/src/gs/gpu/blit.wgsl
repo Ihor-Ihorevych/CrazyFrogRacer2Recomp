@@ -12,6 +12,8 @@ struct Blit {
     out_width: u32,
     out_height: u32,
     options: u32,
+    uv_scale: vec2<f32>,  // zoomed display: the part of the picture that is shown (scale and offset of the 0..1 coordinates)
+    uv_offset: vec2<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> pixels: array<u32>;
@@ -214,7 +216,9 @@ fn reduced_scene(uv: vec2<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fs(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs(in_: VertexOut) -> @location(0) vec4<f32> {
+    var in = in_;
+    in.uv = in_.uv * blit.uv_scale + blit.uv_offset;
     var c: vec3<f32>;
     if (blit.width > blit.out_width + blit.out_width / 16u || blit.height > blit.out_height + blit.out_height / 16u) {
         return vec4<f32>(clamp(reduced_scene(in.uv), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);

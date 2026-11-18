@@ -1,0 +1,73 @@
+#pragma once
+// The hardware renderer ("hwr", docs/hw-renderer-design.md, progress in docs/hw-renderer-progress.md): the GS's triangles and sprites drawn
+// with the graphics card's rasterizer into render targets that stand for GS memory pages, textures decoded once into a content-keyed cache.
+// PS2_RENDERER=hw turns it on (read once at start); the default (PS2_RENDERER unset or =exact) runs none of this code and compiles none of its shaders.
+//
+// gpu.cpp keeps the device, the queue, graphics memory and the compute path for uploads, palette loads and decodes; in hw mode gpu::draw hands
+// every shape to hwr::shape instead of the painter, and hwr's work (render passes, copies of decoded textures into the cache, write-backs of
+// targets into graphics memory) goes into gpu.cpp's command stream at the position where it happened (encode, called from submit()).
+
+#include "../gs.hpp"
+
+#include <webgpu/webgpu.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace ps2::gs::gpu::hwr {
+
+// What hwr needs from gpu.cpp: shared objects and a few calls into it.
+struct Context {
+    WGPUDevice device;
+    WGPUQueue queue;
+    WGPUBuffer decoded;                // gpu.cpp's decoded-texture buffer (decode in gs.wgsl writes here; needs CopySrc in hw mode)
+    std::uint64_t decoded_words;       // its size in words
+    WGPUBindGroupLayout layout;        // gpu.cpp's group 0 (9 entries, binding 2 with a dynamic offset of the parameter record)
+    WGPUBindGroup *group;              // gpu.cpp's current group 0 (rebuilt when its buffers grow; read at encode time)
+    std::uint32_t param_stride;        // bytes per parameter record (the dynamic offset step)
+    const char *gs_shader;             // gs.wgsl text; hwr_sync.wgsl is appended to it for the load/store compute programs
+    const std::uint32_t *swizzle;      // the processor's copy of the address tables (byte offsets inside a page, as gs.wgsl's `tables`)
+    bool dual;                         // the device has dual-source blending
+    std::uint32_t (*position)();       // queued uploads and palette loads become commands; returns the number of compute commands so far
+    std::uint32_t (*decode)(const std::uint32_t *setup, std::uint32_t out_word, std::uint32_t words);  // queue gs.wgsl decode; returns the position after it
+    std::uint32_t (*params)(const std::uint32_t *words, std::uint32_t count);  // a parameter record for a compute program of hwr; returns its index
+    void (*fmt_words)(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t *out);  // gpu.cpp's format words of a setup
+    void (*submit_now)();              // ends the current submit (all queued work goes to the card)
+    std::uint32_t scale = 1;           // PS2_SCALE: graphics memory keeps scale^2 samples per word
+    float target_scale = 0.0f;         // PS2_HWR_SCALE: card texels per GS pixel of the targets (any size, e.g. 1.35); 0 = scale
+};
+
+bool requested();  // PS2_RENDERER=hw
+extern bool g_on;  // set by init when the renderer runs
+bool init(const Context &ctx);
+
+// gpu::draw in hw mode: one primitive (3 corners for triangles, 2 for sprites) with gpu.cpp's 40 setup words and 8 mipmap words.
+// `serial` changes whenever the setup words change (gpu.cpp's setup cache); `mip_top` is the highest mip level a pixel can read.
+void shape(const State &st, const std::uint32_t *setup, const std::uint32_t *mip, std::uint32_t mip_top, std::uint64_t serial, const Vertex *v, int count);
+// an upload chunk queued by gpu.cpp (rec: dbp, dbw, dpsm, dsax, dsay, rrw, done, pixels as queue_upload's record) and its bytes
+void upload(const std::uint32_t *rec, const std::uint8_t *bytes, std::size_t size);
+// a palette load (after gpu.cpp queued it): what load_clut in gs.wgsl reads
+void clut(std::uint32_t cbp, std::uint32_t cpsm, std::uint32_t csm, std::uint32_t csa, bool eight, std::uint32_t cbw, std::uint32_t cou, std::uint32_t cov);
+// the 256-byte blocks of graphics memory that gpu.cpp's queued upload writes (clut false; rec as queue_upload's record) or palette load reads
+// (clut true; rec as load_clut's record): gpu.cpp groups its pending uploads and palette loads with them in hw mode (emit_pre_hwr)
+void pre_blocks(bool clut, const std::uint32_t *rec, std::vector<std::uint32_t> &out);
+// a local copy (TRXDIR 2) overwrote this rectangle of memory
+void local_copy(std::uint32_t dbp, std::uint32_t dbw, std::uint32_t dpsm, int x0, int y0, int x1, int y1);
+// the display reads this rectangle of memory at this point of the stream: the target holding it is written back first
+void before_display(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h);
+// all targets go back to graphics memory (save states, downloads)
+void sync_all();
+// graphics memory was replaced (state load): every target and the identities are dropped
+void state_loaded();
+
+// submit(): hwr's work goes into the same command encoder as gpu.cpp's compute commands, in stream order
+bool pending();
+bool before(std::uint32_t command);   // hwr work waits that goes before compute command `command`
+void prepare();                        // the submit's vertex and parameter data go to the card (one write each)
+WGPUComputePassEncoder encode(WGPUCommandEncoder enc, std::uint32_t upto, WGPUComputePassEncoder pass);
+void submitted();                      // the submit is done: per-submit state is cleared, textures dropped in it are released
+void frame_end();                      // vblank: counters (PS2_HWR_LOG=1 prints one line per frame)
+void stats();                          // end of the run: totals
+
+}

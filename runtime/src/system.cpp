@@ -32,6 +32,10 @@
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include <dlfcn.h>
 #include <pthread.h>
+#if defined(__ANDROID__)
+#include <sched.h>
+#include <unistd.h>
+#endif
 #endif
 #include <atomic>
 #include <cctype>
@@ -46,6 +50,7 @@
 #include <stdexcept>
 #ifndef __EMSCRIPTEN__
 #include <condition_variable>
+#include "ps2/prof.hpp"
 #include <ctime>
 #include <deque>
 #include <initializer_list>
@@ -386,6 +391,7 @@ void vblank() {
         }
     }
     report_load();
+    prof::frame_mark();
     time_frames();
     apply_presses();
     latch_pads();
@@ -496,6 +502,9 @@ bool request_state_operation(bool loading, const char *path, void (*complete)(bo
 
 void set_video_options(std::uint32_t options) { g_video_options.store(options, std::memory_order_relaxed); }
 std::uint32_t video_options() { return g_video_options.load(std::memory_order_relaxed); }
+namespace { std::atomic<int> g_display_mode{0}; }
+void set_display_mode(int mode) { g_display_mode.store(mode < 0 || mode > 2 ? 0 : mode, std::memory_order_relaxed); }
+int display_mode() { return g_display_mode.load(std::memory_order_relaxed); }
 
 namespace {
 
@@ -694,12 +703,14 @@ bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry) {
 }
 
 void sync_iop() {
+    const prof::Scope prof_scope(prof::kIopSync);
     const cost::Timer whole(cost::kSync);
     const std::uint64_t t = now();
     if (t > g_iop_synced) {
         iop::run(t - g_iop_synced);
         g_iop_synced = t;
     }
+    const prof::Scope prof_pump(prof::kSifPump);
     const cost::Timer pump_time(cost::kSifPump);
     sif::pump();
 }
@@ -884,10 +895,18 @@ int run() {
             quick::service();
         }
         c.pc &= ~kUnwind;
-        run_due_events();
-        kernel::service(c);
+        prof::set(prof::kEe);
+        {
+            const prof::Scope p(prof::kEvents);
+            run_due_events();
+        }
+        {
+            const prof::Scope p(prof::kKernel);
+            kernel::service(c);
+        }
         if (g_halted) break;
         if (c.pc == kIdle) {
+            const prof::Scope p(prof::kIdle);
             idle(c);
             continue;
         }
@@ -940,6 +959,7 @@ void start_render_thread() { gs::start_thread(); }
 void start_vu_thread() { gs::queue::vu().start(32u << 20); }
 
 void drain_vu_thread() {
+    const prof::Scope prof_scope(prof::kVuDrain);
     if (gs::queue::role() != gs::queue::Role::Emulation || !gs::queue::vu_active() || gs::queue::vu().empty()) return;
     sync_vu_thread();
 }
@@ -965,6 +985,7 @@ void run_vu_thread() {
         gs::queue::Header h;
         const std::uint8_t *payload = nullptr;
         core_sample(Who::Vu);
+        prof::set(prof::kVuWork);
         crash::test_poll(crash::Thread::VectorUnit);
         if (batch) out.hold();
         while (in.peek(h, payload)) {
@@ -1004,7 +1025,10 @@ void run_vu_thread() {
 #endif
             }
         }
-        if (!found) in.wait_for_work(50);
+        if (!found) {
+            const prof::Scope prof_scope(prof::kVuWait);
+            in.wait_for_work(50);
+        }
         g_vu_idle_ms.store(g_vu_idle_ms.load() + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     }
 }
@@ -1021,6 +1045,7 @@ Rendered render_pending(bool surface, const std::function<void(const std::uint32
         thread_tune(Who::Render);
     }
     core_sample(Who::Render);
+    const prof::Scope prof_scope(prof::kRenderWork);
     crash::test_poll(crash::Thread::Gpu);
     return gs::render_pending([&](const gs::DisplayRegs &regs) {
         quick::on_present(regs);  // the picture for an F9 report is taken here, on the thread that may read the GPU
@@ -1034,7 +1059,10 @@ Rendered render_pending(bool surface, const std::function<void(const std::uint32
     }, budget_ms);
 }
 
-void wait_render_work(int timeout_ms) { gs::queue::render().wait_for_work(timeout_ms); }
+void wait_render_work(int timeout_ms) {
+    const prof::Scope prof_scope(prof::kRenderWait);
+    gs::queue::render().wait_for_work(timeout_ms);
+}
 void wake_render_thread() { gs::queue::render().wake(); }
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return gs::copy_frame(rgba, width, height); }
 
@@ -1269,6 +1297,7 @@ const char *thread_name() { return t_name; }
 void enter_thread(Thread thread) {
     const ThreadInfo &info = kThreads[static_cast<std::size_t>(thread)];
     t_name = info.report;
+    prof::register_thread(info.system);
 #ifdef _WIN32
     // SetThreadDescription (Windows 10 1607 on) names the thread for debuggers and profilers; looked up so older systems still start
     using SetDescription = long(__stdcall *)(void *, const wchar_t *);
@@ -1284,6 +1313,35 @@ void enter_thread(Thread thread) {
     pthread_setname_np(pthread_self(), info.system);
 #elif defined(__APPLE__)
     pthread_setname_np(info.system);  // macOS names only the calling thread
+#endif
+#if defined(__ANDROID__)
+    // Phones may leave the heavy threads on the little cores: keep them on the cores whose top frequency is within 10 % of the fastest
+    // one. Scheduling only, no effect on results. PS2_NO_PIN=1 turns it off.
+    if (thread == Thread::Game || thread == Thread::VectorUnit || thread == Thread::Gpu || thread == Thread::Tiles) {
+        static const cpu_set_t big = [] {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            long freq[64] = {};
+            long best = 0;
+            const int n = static_cast<int>(sysconf(_SC_NPROCESSORS_CONF));
+            for (int i = 0; i < n && i < 64; ++i) {
+                char path[96];
+                std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+                if (FILE *f = std::fopen(path, "r")) {
+                    if (std::fscanf(f, "%ld", &freq[i]) != 1) freq[i] = 0;
+                    std::fclose(f);
+                }
+                best = std::max(best, freq[i]);
+            }
+            int count = 0;
+            if (best > 0)
+                for (int i = 0; i < n && i < 64; ++i)
+                    if (freq[i] * 10 >= best * 9) { CPU_SET(i, &set); ++count; }
+            if (count == 0 || count == n) CPU_ZERO(&set);  // unknown or all alike: leave the scheduler alone
+            return set;
+        }();
+        if (CPU_COUNT(&big) > 0 && !std::getenv("PS2_NO_PIN")) sched_setaffinity(0, sizeof big, &big);
+    }
 #endif
     if (g_hook) g_hook();
 }

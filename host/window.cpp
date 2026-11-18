@@ -1,6 +1,8 @@
 #include "window.hpp"
+#include "ps2/prof.hpp"
 #include "big_stack_thread.hpp"
 #include "stick_map.hpp"
+#include "android_touch.hpp"
 
 #include "ps2/system.hpp"
 
@@ -221,6 +223,12 @@ bool attach_gpu() {
         target.kind = ps2::WindowTarget::Wayland;
         target.display = info.info.wl.display;
         target.surface = info.info.wl.surface;
+        break;
+#endif
+#if defined(SDL_VIDEO_DRIVER_ANDROID)
+    case SDL_SYSWM_ANDROID:
+        target.kind = ps2::WindowTarget::Android;
+        target.surface = info.info.android.window;
         break;
 #endif
 #if defined(SDL_VIDEO_DRIVER_WINDOWS)
@@ -771,6 +779,7 @@ void poll_port(int port) {
     std::uint8_t l2 = 0xFF, r2 = 0xFF;
     std::uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
     if (port == 0) read_keyboard(pressed, lx, ly, rx, ry);
+    if (port == 0) android_touch_merge(pressed, lx, ly);  // the Android overlay
     if (pad) {
         for (const PadBinding &b : kPadButtons)
             if (b.button != SDL_CONTROLLER_BUTTON_BACK && SDL_GameControllerGetButton(pad, b.button)) pressed |= b.mask;
@@ -1439,6 +1448,7 @@ void wait_until(std::uint64_t target) {
 
 void pace() {
     if (no_limit()) return;
+    const ps2::prof::Scope prof_scope(ps2::prof::kLimiter);
     static bool stuck = false;  // the device took no sound for a second; the clock paces the game until it takes some again
     if (g_audio && !audio_paced() && !stuck) {
         g_pipe->frame(audio_seconds());
@@ -1543,6 +1553,9 @@ void show_speed() {
     std::snprintf(title, sizeof title, "ps2-native-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms%s", static_cast<double>(frames) / seconds,
                   (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued, stretched);
     g_speed_title = title;
+    android_note_fps(static_cast<float>(static_cast<double>(frames) / seconds), ps2::g_options.pal ? 50.0f : 59.94f);
+    static const bool speed_log = ps2::os::env("PS2_SPEED_LOG") == "1";  // PS2_SPEED_LOG=1: the title's numbers, once a second, in the log
+    if (speed_log) std::fprintf(stderr, "[speed] %s\n", title);
     refresh_title();
     start = now;
     frames = 0;
@@ -1822,6 +1835,7 @@ bool open_window(bool fullscreen) {
     g_beep_on = no_beep.empty() || no_beep == "0";
     g_pad_log = !pad_log.empty() && pad_log != "0";
     if (!script.empty()) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");  // Android: the phone's tilt sensor is not a game controller
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
@@ -1855,6 +1869,8 @@ bool open_window(bool fullscreen) {
         ps2::os::set_env("PS2_PACE_FROM", g_keys_path);
     }
     g_scale_now = std::clamp(std::atoi(ps2::os::env("PS2_SCALE").c_str()), 1, 4);
+    // how the picture fills the window: PS2_DISPLAY_MODE 0 original 4:3, 1 stretch, 2 zoom (crop); the Android settings change it live
+    if (!ps2::os::env("PS2_DISPLAY_MODE").empty()) ps2::set_display_mode(std::atoi(ps2::os::env("PS2_DISPLAY_MODE").c_str()));
     g_scale_next = g_scale_locked ? g_scale_now : (g_keys.scale >= 1 ? g_keys.scale : g_scale_now);
     // the 2D art filter the same way: PS2_SHARP_2D, else the 'sharp_2d' line of keys.ini, else sharp (gpu.cpp reads it at its start)
     g_sharp_locked = !ps2::os::env("PS2_SHARP_2D").empty();
@@ -1864,6 +1880,10 @@ bool open_window(bool fullscreen) {
     Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
 #ifdef __APPLE__
     if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_METAL;
+#endif
+#ifdef __ANDROID__
+    // wgpu makes a Vulkan surface on SDL's native window: a Vulkan window keeps SDL itself from putting an EGL surface on it
+    if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_VULKAN;
 #endif
     g_game_title = ps2::os::env("PS2_WINDOW_TITLE");
     const std::string initial_title = g_game_title.empty() ? g_speed_title : g_game_title + "   |   " + g_speed_title;

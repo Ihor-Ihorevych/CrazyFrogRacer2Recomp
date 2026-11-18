@@ -5,7 +5,17 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> vram: array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read> tables: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
+// The arena and the shape records (gpu.cpp), as 16-byte groups: a set-up (SETUP_WORDS) and a shape record (PRIM_WORDS) start on a group
+// (the host aligns them), so their words are read four at a time (data4, the same buffer
+// as data).
 @group(0) @binding(3) var<storage, read> data: array<u32>;
+@group(0) @binding(8) var<storage, read> data4: array<vec4<u32>>;
+// WIDE_LOADS = false (PS2_WIDE_LOADS=0) reads every word alone, as before (the same values: only to compare the speed).
+override WIDE_LOADS: bool = true;
+// FAST_SWIZZLE = false (PS2_FAST_SWIZZLE=0): a bilinear read of an 8- or 4-bit texture finds its texels through the address tables, as before (sample).
+override FAST_SWIZZLE: bool = true;
+// SLIM_TAPS = false (PS2_SLIM_TAPS=0): each texel of the 32-bit bilinear read goes through the whole convert() (a copy of its switch per texel).
+override SLIM_TAPS: bool = true;
 @group(0) @binding(4) var<storage, read_write> clut: array<u32>;
 @group(0) @binding(5) var<storage, read_write> scratch: array<u32>;
 @group(0) @binding(6) var<storage, read> cache: array<u32>;
@@ -581,6 +591,62 @@ const F_BILINEAR: u32 = 16384u;
 const F_AEM: u32 = 32768u;
 
 fn load_setup(at: u32) -> Setup {
+    if (!WIDE_LOADS) {
+        return load_setup_narrow(at);
+    }
+    // `at` is a multiple of 4 (setup_offset in gpu.cpp)
+    let g = at >> 2u;
+    let w0 = data4[g];
+    let w1 = data4[g + 1u];
+    let w2 = data4[g + 2u];
+    let w3 = data4[g + 3u];
+    let w4 = data4[g + 4u];
+    let w5 = data4[g + 5u];
+    let w6 = data4[g + 6u];
+    let w7 = data4[g + 7u];
+    let w8 = data4[g + 8u];
+    let w9 = data4[g + 9u];
+    var s: Setup;
+    s.flags = w0.x;
+    s.fbp = w0.y;
+    s.fbw = w0.z;
+    s.fpsm = w0.w;
+    s.fbmsk = w1.x;
+    s.zbp = w1.y;
+    s.zpsm = w1.z;
+    s.modes = w1.w;
+    s.aref = w2.x;
+    s.fix = w2.y;
+    s.scax0 = i32(w2.z & 0xFFFFu);
+    s.scax1 = i32(w2.z >> 16u);
+    s.scay0 = i32(w2.w & 0xFFFFu);
+    s.scay1 = i32(w2.w >> 16u);
+    s.tbp = w3.x;
+    s.tbw = w3.y;
+    s.tpsm = w3.z;
+    s.tw = w3.w & 0xFFu;
+    s.th = w3.w >> 8u;
+    s.cpsm = w4.x;
+    s.csa = w4.y;
+    s.minu = w4.z & 0xFFFFu;
+    s.maxu = w4.z >> 16u;
+    s.minv = w4.w & 0xFFFFu;
+    s.maxv = w4.w >> 16u;
+    s.ta0 = w5.x & 0xFFu;
+    s.ta1 = (w5.x >> 8u) & 0xFFu;
+    s.fogcol = w5.y;
+    s.clut = w5.z;
+    s.zmax = w5.w;
+    s.dec = w6.x;
+    s.tf = Fmt(w6.y, w6.z, w6.w, w7.x, w7.y);
+    s.ff = Fmt(w7.z, w7.w, w8.x, w8.y, w8.z);
+    s.zf = Fmt(w8.w, w9.x, w9.y, w9.z, w9.w);
+    s.mip = 0u;
+    s.mip_at = 0u;
+    return s;
+}
+
+fn load_setup_narrow(at: u32) -> Setup {
     var s: Setup;
     s.flags = data[at];
     s.fbp = data[at + 1u];
@@ -799,6 +865,34 @@ fn spread_y(y: u32) -> u32 {
     return ((y & 1u) << 1u) | ((y & 6u) << 3u) | ((y & 8u) << 4u) | ((y & 16u) << 5u);
 }
 
+// The place inside a page of an 8-bit (PSMT8) or 4-bit (PSMT4) texel, as the address tables have it (T_OFF8 in bytes, T_OFF4 in nibbles;
+// gs.cpp, build_tables), worked out from the bits of x and y: each bit of x and y lands on one bit of the offset, and bit 2 of x, bit 1
+// and bit 2 of y meet in one (the column's swap), so the offset is the x part XOR the y part (checked against the tables for every
+// position of a page). A bilinear read then works out the x part for its two columns and the y part for its two rows, not a table
+// read for each of its four texels before the texel itself.
+fn swz_x(x: u32, four: bool) -> u32 {
+    if (four) {
+        return ((x & 0x18u) >> 2u) | ((x & 1u) << 3u) | ((x & 6u) << 4u) | ((x & 0x20u) << 5u) | ((x & 0x40u) << 6u);
+    }
+    return ((x & 8u) >> 2u) | ((x & 1u) << 2u) | ((x & 6u) << 3u) | ((x & 0x10u) << 4u) | ((x & 0x20u) << 5u) | ((x & 0x40u) << 6u);
+}
+
+fn swz_y(y: u32, four: bool) -> u32 {
+    let swap = ((y >> 1u) ^ (y >> 2u)) & 1u;
+    if (four) {
+        return ((y & 2u) >> 1u) | ((y & 1u) << 4u) | (swap << 6u) | ((y & 0x1Cu) << 5u) | ((y & 0x20u) << 6u) | ((y & 0x40u) << 7u);
+    }
+    return ((y & 2u) >> 1u) | ((y & 1u) << 3u) | (swap << 5u) | ((y & 0xCu) << 4u) | ((y & 0x10u) << 5u) | ((y & 0x20u) << 6u);
+}
+
+// The palette entry of one texel of an 8- or 4-bit texture: `page` is the texture's base plus its page's offset, `n` the place in the page
+// (swz_x ^ swz_y), `nbit` 1 for 4 bits a texel (n counts nibbles), `slot` where the texture's entries start in `clut`. The same word, shift
+// and mask as addr() and load_texel give, then the entry convert() reads (for 4 bits, CSA's 16 entries: an index of at most 255).
+fn tap_clut(s: Setup, page: u32, n: u32, nbit: u32, slot: u32, k: u32) -> u32 {
+    let a = page + (n >> nbit);
+    return clut[slot + load_texel(Loc((a & 0x3FFFFFu) >> 2u, (a & 3u) * 8u + (n & nbit) * 4u, s.tf.mask), k)];
+}
+
 fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
     let word = ((page + (n << 2u)) & 0x3FFFFFu) >> 2u;
     var raw = 0u;
@@ -807,7 +901,23 @@ fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
     } else {
         raw = atomicLoad(&vram[word * SCALE * SCALE + k]);
     }
+    if (SLIM_TAPS) {
+        // convert() of the two formats this path reads
+        if (s.tpsm == PSMCT24) {
+            return conv24(s, raw);
+        }
+        return raw;
+    }
     return convert(s, raw & s.tf.mask);
+}
+
+// convert() of a PSMCT24 texel
+fn conv24(s: Setup, raw: u32) -> u32 {
+    var a = s.ta0;
+    if (has(s, F_AEM) && (raw & 0xFFFFFFu) == 0u) {
+        a = 0u;
+    }
+    return (raw & 0xFFFFFFu) | (a << 24u);
 }
 
 // The 2D art of a game (text, icons, menus) is mostly sprites that map one texel to one pixel at the PS2's resolution. Upscaled,
@@ -897,6 +1007,32 @@ fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
         let nya = spread_y(ya);
         let nyb = spread_y(yb);
         return blend4(tap32(s, pxa + pya, nxa | nya, k), tap32(s, pxb + pya, nxb | nya, k), tap32(s, pxa + pyb, nxa | nyb, k), tap32(s, pxb + pyb, nxb | nyb, k), fx, fy);
+    }
+    if (FAST_SWIZZLE && s.dec == 0xFFFFFFFFu && (s.tpsm == 0x13u || s.tpsm == 0x14u)) {
+        // 8 and 4 bits: pages of 128 x 64 and 128 x 128 texels (fmt_words in gpu.cpp)
+        let four = s.tpsm == 0x14u;
+        let phs = select(6u, 7u, four);
+        let nbit = select(0u, 1u, four);
+        let pxa = (xa >> 7u) * 8192u + s.tf.base;
+        let pxb = (xb >> 7u) * 8192u + s.tf.base;
+        let pya = (ya >> phs) * s.tf.per_row * 8192u;
+        let pyb = (yb >> phs) * s.tf.per_row * 8192u;
+        let nxa = swz_x(xa, four);
+        let nxb = swz_x(xb, four);
+        let nya = swz_y(ya, four);
+        let nyb = swz_y(yb, four);
+        let slot = s.clut * CLUT_ENTRIES + select(0u, (s.csa & 15u) * 16u, four);
+        var c00 = tap_clut(s, pxa + pya, nxa ^ nya, nbit, slot, k);
+        var c10 = tap_clut(s, pxb + pya, nxb ^ nya, nbit, slot, k);
+        var c01 = tap_clut(s, pxa + pyb, nxa ^ nyb, nbit, slot, k);
+        var c11 = tap_clut(s, pxb + pyb, nxb ^ nyb, nbit, slot, k);
+        if (s.cpsm != PSMCT32 && s.cpsm != PSMCT24) {
+            c00 = expand16(c00, s);
+            c10 = expand16(c10, s);
+            c01 = expand16(c01, s);
+            c11 = expand16(c11, s);
+        }
+        return blend4(c00, c10, c01, c11, fx, fy);
     }
     return blend4(fetch_at(s, xa, ya, k), fetch_at(s, xb, ya, k), fetch_at(s, xa, yb, k), fetch_at(s, xb, yb, k), fx, fy);
 }
@@ -1380,13 +1516,19 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
     sharp_sprite = false;
     switch kind {
         case 0u {
-            let x0 = fat(p + 4u);
-            let y0 = fat(p + 5u);
-            let x1 = fat(p + 6u);
-            let y1 = fat(p + 7u);
-            let x2 = fat(p + 8u);
-            let y2 = fat(p + 9u);
-            let inv = fat(p + 10u);
+            var ca = vec4<f32>(fat(p + 4u), fat(p + 5u), fat(p + 6u), fat(p + 7u));
+            var cb = vec4<u32>(data[p + 8u], data[p + 9u], data[p + 10u], 0u);
+            if (WIDE_LOADS) {
+                ca = bitcast<vec4<f32>>(data4[(p >> 2u) + 1u]);
+                cb = data4[(p >> 2u) + 2u];
+            }
+            let x0 = ca.x;
+            let y0 = ca.y;
+            let x1 = ca.z;
+            let y1 = ca.w;
+            let x2 = bitcast<f32>(cb.x);
+            let y2 = bitcast<f32>(cb.y);
+            let inv = bitcast<f32>(cb.z);
             let s0 = cross2(x1 - px, y2 - py, x2 - px, y1 - py) * inv;
             let s1 = cross2(x2 - px, y0 - py, x0 - px, y2 - py) * inv;
             let c2 = cross2(x0 - px, y1 - py, x1 - px, y0 - py) * inv;
@@ -1601,14 +1743,23 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
 }
 
+// A dispatch may carry several drawing runs (fuse_runs in gpu.cpp). With word 8 of the parameter record at 0 it is one run, as always: word 0 is
+// its table of tiles (origin and first list entry, two words each), 3 their number. With word 8 = M it is M runs, in the order they were drawn:
+// word 0 is a table with a row of M + 1 words for each tile of any of them (the origin, then for each run where its entry for this tile is, or
+// ~0 when it has none), 3 the number of rows, and run r has its prims, setups, lists and mips words at 16 + 4 * r. A thread does the runs' lists
+// for its tile one after the other.
 @compute @workgroup_size(TILE, TILE)
 fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let index = wid.x + wid.y * 1024u;
     if (index >= prm(3u)) {
         return;
     }
-    let tile = prm(0u) + index * 2u;
-    let origin = data[tile];
+    let runs = prm(8u);
+    var entry = prm(0u) + index * 2u;
+    if (runs != 0u) {
+        entry = prm(0u) + index * (runs + 1u);
+    }
+    let origin = data[entry];
     let sx = (origin & 0xFFFFu) * TILE + lid.x;
     let sy = (origin >> 16u) * TILE + lid.y;
     let x = i32(sx / SCALE);
@@ -1616,35 +1767,53 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let k = (sy % SCALE) * SCALE + sx % SCALE;
     let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
     let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
-    let first = data[tile + 1u];
-    let count = data[tile + 3u] - first;
-    let lists = prm(4u);
-    let prims = prm(1u);
-    let setups = prm(2u);
     snapshot_lo = prm(5u);
     snapshot_hi = prm(6u);
-    let mips = prm(9u);  // words 7 and 8 are not used here
-    var last_setup = 0xFFFFFFFFu;
-    var s: Setup;
-    for (var i = 0u; i < count; i = i + 1u) {
-        let h = first + i;
-        let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
-        let si = data[p];
-        if (si != last_setup) {
-            s = load_setup(setups + si * SETUP_WORDS);
-            if (HAS_MIP && mips != 0xFFFFFFFFu) {
-                s.mip_at = mips + si * MIP_WORDS;
-                s.mip = data[s.mip_at];
+    for (var r = 0u; r < max(runs, 1u); r = r + 1u) {
+        var tile = entry;
+        var lists = prm(4u);
+        var prims = prm(1u);
+        var setups = prm(2u);
+        var mips = prm(9u);  // words 7 is not used here
+        if (runs != 0u) {
+            tile = data[entry + 1u + r];
+            if (tile == 0xFFFFFFFFu) {
+                continue;
             }
-            pix_fl = addr(s.ff, u32(x), u32(y));
-            pix_zl = addr(s.zf, u32(x), u32(y));
-            last_setup = si;
+            prims = prm(16u + r * 4u);
+            setups = prm(17u + r * 4u);
+            lists = prm(18u + r * 4u);
+            mips = prm(19u + r * 4u);
         }
-        let lo = data[p + 2u];
-        let hi = data[p + 3u];
-        if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
-            continue;
+        let first = data[tile + 1u];
+        let count = data[tile + 3u] - first;
+        var last_setup = 0xFFFFFFFFu;
+        var s: Setup;
+        for (var i = 0u; i < count; i = i + 1u) {
+            let h = first + i;
+            let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
+            var head = vec4<u32>(data[p], 0u, data[p + 2u], data[p + 3u]);  // set-up, kind, box corners
+            if (WIDE_LOADS) {
+                head = data4[p >> 2u];
+            }
+            let si = head.x;
+            if (si != last_setup) {
+                s = load_setup(setups + si * SETUP_WORDS);
+                if (HAS_MIP && mips != 0xFFFFFFFFu) {
+                    s.mip_at = mips + si * MIP_WORDS;
+                    s.mip = data[s.mip_at];
+                }
+                pix_fl = addr(s.ff, u32(x), u32(y));
+                pix_zl = addr(s.zf, u32(x), u32(y));
+                last_setup = si;
+            }
+            let lo = head.z;
+            let hi = head.w;
+            if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
+                continue;
+            }
+            shade_at(p, s, x, y, k, px, py);
         }
-        shade_at(p, s, x, y, k, px, py);
     }
+
 }

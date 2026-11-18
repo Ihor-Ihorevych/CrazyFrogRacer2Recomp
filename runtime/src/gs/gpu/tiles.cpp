@@ -1,4 +1,5 @@
 #include "tiles.hpp"
+#include "ps2/prof.hpp"
 
 #include "../queue.hpp"
 #include "ps2/crash.hpp"
@@ -370,7 +371,10 @@ void wait_for_shapes(Shared *s, const Job *job, std::uint32_t at) {
     } while (std::chrono::steady_clock::now() < until);
     const std::uint32_t seen = s->bell.load();
     s->sleeping.store(1);  // sequentially consistent, like the loads in more() and feed's and close's stores and ring_bell's check
-    if (!more()) futex_wait(s->bell, seen);
+    if (!more()) {
+        const ps2::prof::Scope prof_scope(ps2::prof::kTilesWait);
+        futex_wait(s->bell, seen);
+    }
     s->sleeping.store(0);
 }
 
@@ -430,7 +434,10 @@ void helper_main(Shared *s) {
             if (!found) {
                 const std::uint32_t seen = s->bell.load();
                 s->sleeping.store(1);  // sequentially consistent, like the head check after it and the window thread's publish and sleeping check: one of the two sees the other
-                if (s->head.load() == at) futex_wait(s->bell, seen);
+                if (s->head.load() == at) {
+                    const ps2::prof::Scope prof_scope(ps2::prof::kTilesWait);
+                    futex_wait(s->bell, seen);
+                }
                 s->sleeping.store(0);
             }
             continue;

@@ -2202,9 +2202,9 @@ bool build_gpu(Context &c) {
     if (!P.params.empty()) wgpuQueueWriteBuffer(c.queue, G.params, 0, P.params.data(), P.params.size() * 256);
     if (!G.decoded) G.decoded = make_buffer(c, static_cast<std::uint64_t>(g_cache ? kCacheWords : kDecodedWords) * 4, static_cast<WGPUBufferUsage>(WGPUBufferUsage_Storage | (g_cache ? WGPUBufferUsage_CopySrc : 0)));  // (the test program builds many frames, so the buffer is made once)
     {
-        WGPUBindGroupEntry e[8] = {};
-        WGPUBuffer buffers[8] = {c.vram, c.tables, G.params, G.setups, c.clut, c.scratch, c.cache, G.decoded};
-        for (int i = 0; i < 8; ++i) {
+        WGPUBindGroupEntry e[9] = {};
+        WGPUBuffer buffers[9] = {c.vram, c.tables, G.params, G.setups, c.clut, c.scratch, c.cache, G.decoded, G.setups};  // 8: binding 3 again (gs.wgsl, data4)
+        for (int i = 0; i < 9; ++i) {
             e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
             e[i].binding = static_cast<std::uint32_t>(i);
             e[i].buffer = buffers[i];
@@ -2212,7 +2212,7 @@ bool build_gpu(Context &c) {
         }
         WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
         d.layout = c.layout;
-        d.entryCount = 8;
+        d.entryCount = 9;
         d.entries = e;
         G.group = memlog::new_group(c.device, &d);
     }
@@ -4215,9 +4215,9 @@ void live_prepare() {
     changed |= grow(LV.pbuf, LV.pcap, LV.params.size() * 256, static_cast<WGPUBufferUsage>(WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst));
     if (changed) {
         if (LV.group) memlog::del_group(LV.group);
-        WGPUBindGroupEntry e[8] = {};
-        WGPUBuffer buffers[8] = {c.vram, c.tables, LV.pbuf, LV.sbuf, c.clut, c.scratch, c.cache, LV.dummy_buf};
-        for (int i = 0; i < 8; ++i) {
+        WGPUBindGroupEntry e[9] = {};
+        WGPUBuffer buffers[9] = {c.vram, c.tables, LV.pbuf, LV.sbuf, c.clut, c.scratch, c.cache, LV.dummy_buf, LV.sbuf};  // 8: binding 3 again (gs.wgsl, data4)
+        for (int i = 0; i < 9; ++i) {
             e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
             e[i].binding = static_cast<std::uint32_t>(i);
             e[i].buffer = buffers[i];
@@ -4225,7 +4225,7 @@ void live_prepare() {
         }
         WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
         d.layout = c.layout;
-        d.entryCount = 8;
+        d.entryCount = 9;
         d.entries = e;
         LV.group = memlog::new_group(c.device, &d);
         ++LV.render_gen;

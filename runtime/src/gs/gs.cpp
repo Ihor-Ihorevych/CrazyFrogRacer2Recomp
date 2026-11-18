@@ -1,4 +1,5 @@
 #include "gs.hpp"
+#include "ps2/prof.hpp"
 
 #include "gif.hpp"
 #include "queue.hpp"
@@ -1410,7 +1411,14 @@ void post_present() {
     const DisplayRegs regs = display_regs();
     queue::post(queue::kPresent, static_cast<std::uint32_t>(frame_count()), 0, &regs, sizeof regs);
     ++g_posted_presents;
-    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
+    // How many pictures the emulation may run ahead of the screen (2). PS2_PRESENT_AHEAD=<n> tries another number.
+    static const std::uint32_t ahead = [] {
+        const std::string v = os::env("PS2_PRESENT_AHEAD");
+        const int n = v.empty() ? 2 : std::atoi(v.c_str());
+        return static_cast<std::uint32_t>(n < 1 ? 1 : n);
+    }();
+    const prof::Scope prof_scope(prof::kPresentWait);
+    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > ahead; done = g_presented.load()) queue::wait(g_presented, done);
 }
 
 Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {

@@ -1,4 +1,5 @@
 #include "queue.hpp"
+#include "ps2/prof.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -184,6 +185,7 @@ void Ring::publish() {
 // ring empty or goes to sleep; a wake missed between the two costs at most the 1 ms the sleep is bounded by, and needs the whole ring
 // unread.
 void Ring::wait_for_space(std::uint64_t until_tail) {
+    const ps2::prof::Scope prof_scope(ps2::prof::kQueueFull);
     if (write_ != published_) publish();
     const std::uint64_t t0 = qs_on() ? now_us() : 0;
     for (;;) {

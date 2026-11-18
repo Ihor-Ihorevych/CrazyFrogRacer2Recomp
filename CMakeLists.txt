@@ -32,6 +32,12 @@ if(EMSCRIPTEN)
     add_link_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
 endif()
 
+# AArch64: clang fuses a * b + c into one FMA by default (-ffp-contract=on), which rounds once and changes the results of the
+# float code the vector units, the FPU and the graphics setup emulate; x86 builds only fuse with -mfma/-mavx2 (scripts/cxx.sh).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    add_compile_options(-ffp-contract=off)
+endif()
+
 if(NOT EMSCRIPTEN)
     add_executable(eerecomp
         recomp/main.cpp
@@ -62,6 +68,7 @@ else()
     add_library(ps2runtime STATIC
         runtime/src/memory.cpp
         runtime/src/os.cpp
+        runtime/src/prof.cpp
         runtime/src/dispatch.cpp
         runtime/src/system.cpp
         runtime/src/kernel.cpp
@@ -176,7 +183,7 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
         DEPENDS runtime/src/gs/gpu/blit.wgsl cmake/embed.cmake)
     # The experimental hardware drawing path (hwdraw*, hwcache*, hwstat*): off unless PS2_GPU_HW=1 is set. The browser build
     # compiles the three files as empty stubs and embeds none of its shaders.
-    set(PS2_HW_SOURCES runtime/src/gs/gpu/hwdraw.cpp runtime/src/gs/gpu/hwstat.cpp runtime/src/gs/gpu/hwcache.cpp)
+    set(PS2_HW_SOURCES runtime/src/gs/gpu/hwdraw.cpp runtime/src/gs/gpu/hwstat.cpp runtime/src/gs/gpu/hwcache.cpp runtime/src/gs/gpu/hwr.cpp)
     if(NOT EMSCRIPTEN)
         set(PS2_HW_WGSL "${CMAKE_BINARY_DIR}/hw_wgsl.cpp")
         add_custom_command(OUTPUT "${PS2_HW_WGSL}"
@@ -190,7 +197,16 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
         add_custom_command(OUTPUT "${PS2_HW_SYNC_WGSL}"
             COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hwdraw_sync.wgsl -DOUT=${PS2_HW_SYNC_WGSL} -DNAME=kHwSyncShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
             DEPENDS runtime/src/gs/gpu/hwdraw_sync.wgsl cmake/embed.cmake)
-        list(APPEND PS2_HW_SOURCES "${PS2_HW_WGSL}" "${PS2_HW_SYNC_WGSL}" "${PS2_CACHE_WGSL}")
+        # the hardware renderer (hwr.cpp, PS2_RENDERER=hw): its drawing program and its transfers (appended to gs.wgsl)
+        set(PS2_HWR_WGSL "${CMAKE_BINARY_DIR}/hwr_wgsl.cpp")
+        add_custom_command(OUTPUT "${PS2_HWR_WGSL}"
+            COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hwr.wgsl -DOUT=${PS2_HWR_WGSL} -DNAME=kHwrShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+            DEPENDS runtime/src/gs/gpu/hwr.wgsl cmake/embed.cmake)
+        set(PS2_HWR_SYNC_WGSL "${CMAKE_BINARY_DIR}/hwr_sync_wgsl.cpp")
+        add_custom_command(OUTPUT "${PS2_HWR_SYNC_WGSL}"
+            COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hwr_sync.wgsl -DOUT=${PS2_HWR_SYNC_WGSL} -DNAME=kHwrSyncShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+            DEPENDS runtime/src/gs/gpu/hwr_sync.wgsl cmake/embed.cmake)
+        list(APPEND PS2_HW_SOURCES "${PS2_HW_WGSL}" "${PS2_HW_SYNC_WGSL}" "${PS2_CACHE_WGSL}" "${PS2_HWR_WGSL}" "${PS2_HWR_SYNC_WGSL}")
     endif()
     if(NOT PS2_PREBUILT)
         target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp runtime/src/gs/gpu/tiles.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" ${PS2_HW_SOURCES})
@@ -206,7 +222,12 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
         if(WIN32)
             target_link_libraries(ps2runtime ${PS2_API} "${PS2_WGPU_DIR}/lib/libwgpu_native.a" ws2_32 userenv ntdll synchronization pthread m)
         else()
-            target_link_libraries(ps2runtime ${PS2_API} "${PS2_WGPU_DIR}/lib/libwgpu_native.a" dl pthread m)
+            if(ANDROID)
+                # Bionic has pthread inside libc
+                target_link_libraries(ps2runtime ${PS2_API} "${PS2_WGPU_DIR}/lib/libwgpu_native.a" dl m android log)
+            else()
+                target_link_libraries(ps2runtime ${PS2_API} "${PS2_WGPU_DIR}/lib/libwgpu_native.a" dl pthread m)
+            endif()
         endif()
         if(APPLE)
             target_link_libraries(ps2runtime ${PS2_API} "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreFoundation" "-framework IOKit" "-framework IOSurface" objc)
@@ -506,7 +527,14 @@ if(PS2_GENERATED)
         return()
     endif()
 
-    add_executable(ps2run host/main.cpp host/crash.cpp)  # crash.cpp: the lines a crash writes to the log
+    if(ANDROID)
+        # libmain.so, loaded by SDL's Java activity (android/); there is no executable on Android
+        add_library(ps2run SHARED host/main.cpp host/crash.cpp host/android_touch.cpp)
+        set_target_properties(ps2run PROPERTIES OUTPUT_NAME main)
+        target_link_libraries(ps2run PRIVATE android log)
+    else()
+        add_executable(ps2run host/main.cpp host/crash.cpp)  # crash.cpp: the lines a crash writes to the log
+    endif()
     target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         target_sources(ps2run PRIVATE host/profile.cpp)

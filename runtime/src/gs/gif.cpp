@@ -248,7 +248,11 @@ struct Held {
     bool masked = false, mid_packet = false, flowing = false;
     std::uint64_t left = 0;
     bool eop = false;
+    // what is held is data[head..]: a released packet only moves head (erasing it from the front moved all the rest each time, and the
+    // game lets its streamed textures out one packet at a time: half the vector thread's time went into that)
     std::vector<std::uint8_t> data;
+    std::size_t head = 0;
+    bool empty() const { return head >= data.size(); }
 } g_held;
 
 bool hold_here() { return !gs::queue::vu_active() || gs::queue::role() == gs::queue::Role::Vu; }
@@ -296,15 +300,22 @@ std::uint32_t packet_length(const std::uint8_t *data, std::uint32_t qwc) {
 void release(bool only_one) {
     Held &h = g_held;
     std::size_t done = 0;
-    const std::uint32_t total = static_cast<std::uint32_t>(h.data.size() / 16);
+    const std::uint32_t total = static_cast<std::uint32_t>((h.data.size() - h.head) / 16);
     while (done < total && (!h.masked || h.mid_packet)) {
-        const std::uint8_t *at = h.data.data() + done * 16;
+        const std::uint8_t *at = h.data.data() + h.head + done * 16;
         const std::uint32_t n = packet_length(at, static_cast<std::uint32_t>(total - done));
         out(3, at, n);
         done += n;
         if (only_one && !h.mid_packet) break;
     }
-    h.data.erase(h.data.begin(), h.data.begin() + static_cast<std::ptrdiff_t>(done * 16));
+    h.head += done * 16;
+    if (h.head >= h.data.size()) {
+        h.data.clear();
+        h.head = 0;
+    } else if (h.head >= (256u << 10) && h.head * 2 >= h.data.size()) {  // the released part is the larger one: drop it now and then
+        h.data.erase(h.data.begin(), h.data.begin() + static_cast<std::ptrdiff_t>(h.head));
+        h.head = 0;
+    }
 }
 
 }
@@ -374,7 +385,7 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
         out(path, data, qwc);
         return;
     }
-    if (h.data.empty() && (!h.masked || h.mid_packet)) {
+    if (h.empty() && (!h.masked || h.mid_packet)) {
         std::uint32_t done = 0;
         while (done < qwc && (!h.masked || h.mid_packet)) done += packet_length(data + static_cast<std::size_t>(done) * 16, qwc - done);
         out(3, data, done);
@@ -438,9 +449,9 @@ void set_path3_masked(bool masked) {
     h.masked = masked;
     // The packet that starts as the mask drops gets through even if the mask goes straight
     // back up; the rest waits for more GIF traffic or for VIF1 to go idle with it still down.
-    if (was && !masked && !h.data.empty()) {
+    if (was && !masked && !h.empty()) {
         release(true);
-        h.flowing = !h.data.empty();
+        h.flowing = !h.empty();
     }
 }
 

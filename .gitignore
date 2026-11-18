@@ -75,3 +75,14 @@ __pycache__/
 
 # Games packed into one file (scripts/extract_disc.py bundle).
 /dist/
+
+# Android app (android/): built libraries and packages hold the game's code, the keystore signs them. Only sources go in.
+*.so
+*.apk
+*.apk.idsig
+*.aab
+*.dex
+*.keystore
+*.jks
+/android/out/
+/android/libs/

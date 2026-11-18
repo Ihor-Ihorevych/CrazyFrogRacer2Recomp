@@ -1,4 +1,5 @@
 #include "dmac.hpp"
+#include "ps2/prof.hpp"
 
 #include "kernel.hpp"
 
@@ -353,6 +354,7 @@ void run_chain(int ch) {
 }
 
 void start(int ch) {
+    const ps2::prof::Scope prof_scope(ps2::prof::kDma);
     Channel &c = g_ch[ch];
     c.paused = false;
     c.tag_end = c.qwc && chain_ends_after_current(c);
@@ -378,6 +380,7 @@ void start(int ch) {
 }
 
 void resume(int ch) {
+    const ps2::prof::Scope prof_scope(ps2::prof::kDma);
     Channel &c = g_ch[ch];
     if (!c.paused) return;
     c.paused = false;

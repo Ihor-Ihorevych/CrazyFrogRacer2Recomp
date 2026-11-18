@@ -1,4 +1,5 @@
 #include "vu_micro.hpp"
+#include "ps2/prof.hpp"
 
 #include "gs/gif.hpp"
 #include "gs/queue.hpp"
@@ -1224,8 +1225,38 @@ void time_note(std::uint64_t key, std::uint64_t ticks) {
     row.ticks += ticks;
 }
 
+namespace {
+// PS2_PROF: how many VU1 programs ran compiled and how many interpreted, and the time each took (vector unit thread)
+struct ProfCounter {
+    std::atomic<std::uint64_t> calls{0}, ns{0};
+};
+ProfCounter g_prof_compiled, g_prof_interpreted;
+struct ProfTimer {
+    ProfCounter *counter;
+    std::chrono::steady_clock::time_point from;
+    explicit ProfTimer(ProfCounter &c) : counter(ps2::prof::g_on ? &c : nullptr) {
+        if (counter) from = std::chrono::steady_clock::now();
+    }
+    ~ProfTimer() {
+        if (!counter) return;
+        counter->calls.fetch_add(1, std::memory_order_relaxed);
+        counter->ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count()), std::memory_order_relaxed);
+    }
+};
+void prof_register_once() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    ps2::prof::add_counter("vu1 compiled calls", &g_prof_compiled.calls, 1.0);
+    ps2::prof::add_counter("vu1 compiled ms", &g_prof_compiled.ns, 1e-6);
+    ps2::prof::add_counter("vu1 interpreted calls", &g_prof_interpreted.calls, 1.0);
+    ps2::prof::add_counter("vu1 interpreted ms", &g_prof_interpreted.ns, 1e-6);
+}
+}  // namespace
+
 void run_entry(int unit, std::uint32_t pc) {
     if (unit == 1) g_trace_vu1_pc = pc;
+    if (unit == 1 && ps2::prof::g_on) prof_register_once();
     if (unit == 1) { static const bool log_runs = std::getenv("PS2_TRACE_VU1RUN") != nullptr; if (log_runs) std::fprintf(stderr, "[vu1-run] pc %X\n", pc); }
     // Compiled programs are the default; retain an interpreter override for
     // differential checks and diagnosing newly recorded programs.
@@ -1291,6 +1322,7 @@ void run_entry(int unit, std::uint32_t pc) {
                 if (escape >= 0) interpret(1, static_cast<std::uint32_t>(escape));
                 return;
             }
+            const ProfTimer prof_timer(g_prof_compiled);
             static const bool timed = std::getenv("PS2_VU_TIME") != nullptr;
             if (timed) {
                 const std::uint64_t t0 = time_stamp();
@@ -1312,6 +1344,11 @@ void run_entry(int unit, std::uint32_t pc) {
             for (const auto &[a, n] : misses) std::fprintf(stderr, " %04X:%llu", a, static_cast<unsigned long long>(n));
             std::fprintf(stderr, "\n");
         }
+    }
+    if (unit == 1) {
+        const ProfTimer prof_timer(g_prof_interpreted);
+        run_fast(unit, pc);
+        return;
     }
     run_fast(unit, pc);
 }

@@ -11,6 +11,11 @@
 #ifdef PS2_WINDOW
 #include "window.hpp"
 #endif
+#if defined(__ANDROID__) && defined(PS2_WINDOW)
+// SDL's Android activity loads libmain.so and calls SDL_main (this renames main below); the program name and options come from
+// SDLActivity.getArguments() in the app
+#include <SDL_main.h>
+#endif
 #ifdef PS2_PROFILE
 #include "profile.hpp"
 #endif

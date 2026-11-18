@@ -1,4 +1,5 @@
 #include "ipu.hpp"
+#include "ps2/prof.hpp"
 
 #include "idct.hpp"
 #include "tables.hpp"
@@ -824,6 +825,7 @@ std::uint64_t read64(std::uint32_t a) {
 }
 
 void write32(std::uint32_t a, std::uint32_t v) {
+    const ps2::prof::Scope prof_scope(ps2::prof::kIpu);
     switch (a) {
     case 0x10002000u: {
     }
@@ -869,6 +871,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
 }
 
 void write_fifo(const std::uint8_t *qword) {
+    const ps2::prof::Scope prof_scope(ps2::prof::kIpu);
     dump_input(qword, 16);
     g_in.insert(g_in.end(), qword, qword + 16);
     step();
