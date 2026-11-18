@@ -190,8 +190,11 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
         }
     };
     const std::string dst = target == kAcc ? "r.acc" : std::format("r.vf[{}]", target);
-    const bool vector = !exact && (kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs || kind == Ftoi || kind == Itof);
-    const bool arithmetic = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub;
+    // OPMULA and OPMSUB are a MUL and an MSUB of the operands' lanes turned (fs as y z x, ft as z x y; x y z written): each lane is the
+    // same float operation as the lane-by-lane form (mul / msub on that lane's numbers), done for the three lanes at once.
+    const bool outer = kind == Opmula || kind == Opmsub;
+    const bool vector = !exact && (kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs || kind == Ftoi || kind == Itof || outer);
+    const bool arithmetic = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || (outer && !exact);
     if (target != 0) {
         u.target = target;
         u.mask = d;
@@ -214,8 +217,12 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
         case Q: nb = "vqd(r.q)"; break;
         default: nb = "vfix(vsplat(r.i))"; break;
         }
-        const std::string ns = operand(fs);
-        if (kind == Madd || kind == Msub) u.shadow_reads.push_back(kAcc);
+        std::string ns = operand(fs);
+        if (outer) {
+            ns = std::format("vyzxw({})", ns);
+            nb = std::format("vzxyw({})", nb);
+        }
+        if (kind == Madd || kind == Msub || kind == Opmsub) u.shadow_reads.push_back(kAcc);
         // vf00 is the constant (0, 0, 0, 1), and its broadcast lanes are 0 or 1. Both operands have been through vfix, so a sum, difference
         // or product with such a constant needs no vfix of its own: x +- 0 is x (or +0 for -0), x +- 1 stays clear of the largest
         // float (it rounds back to it) and of the denormals (a sum with 1 is 0 or at least 2^-24 away from it), x * 1 is x and x * 0 is
@@ -227,7 +234,7 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
         switch (kind) {
         case Add: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} + (v4f){}); ", ns, nb) : std::format("const v4u uv = vaddd({}, {}); ", ns, nb); break;
         case Sub: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} - (v4f){}); ", ns, nb) : std::format("const v4u uv = vsubd({}, {}); ", ns, nb); break;
-        case Mul: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} * (v4f){}); ", ns, nb) : std::format("const v4u uv = vmuld({}, {}); ", ns, nb); break;
+        case Mul: case Opmula: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} * (v4f){}); ", ns, nb) : std::format("const v4u uv = vmuld({}, {}); ", ns, nb); break;
         case Madd: u.pre += constant_lanes ? std::format("const v4u uv = vaddd(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmaddd(nacc, {}, {}); ", ns, nb); break;
         default: u.pre += constant_lanes ? std::format("const v4u uv = vsubd(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmsubd(nacc, {}, {}); ", ns, nb); break;
         }

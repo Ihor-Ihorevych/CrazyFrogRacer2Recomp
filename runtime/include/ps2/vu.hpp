@@ -446,5 +446,14 @@ PS2_VU4 void ftoi4(Vu0Regs &v, unsigned dest, unsigned ft, unsigned fs, int frac
     const u32x4 most = (x >> 31) + 0x7FFFFFFFu;
     v4::keep(v, dest, ft, (whole & ~big) | (most & big));
 }
+// itof(), fp::from_fixed on four lanes: the integer as a double (exact), cut to the 24 bits of a float the way from_double cuts
+// (towards zero), then as a float (exact now) times 2^-fraction (exact: the smallest non-zero magnitude, 2^-15, is a normal
+// number). A zero lane is +0, as from_double gives it. Checked against itof() on every one of the 2^32 inputs for each fraction.
+PS2_VU4 void itof4(Vu0Regs &v, unsigned dest, unsigned ft, unsigned fs, int fraction) {
+    const v4::f64x4 d = __builtin_convertvector((s32x4)v.vf[fs].uw4, v4::f64x4);
+    const v4::f64x4 cut = (v4::f64x4)((v4::u64x4)d & static_cast<std::uint64_t>(0xFFFFFFFFE0000000ull));
+    const f32x4 f = __builtin_convertvector(cut, f32x4);
+    v4::keep(v, dest, ft, (u32x4)(f * (f32x4)v4::splat((127u - static_cast<std::uint32_t>(fraction)) << 23)));
+}
 
 }

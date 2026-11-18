@@ -8,6 +8,8 @@
 #include <smmintrin.h>
 #elif defined(__SSE2__)
 #include <emmintrin.h>
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 
 #include <algorithm>
@@ -663,6 +665,9 @@ PS2_VU_INLINE v4u vload_ptr(const void *p) {
 }
 PS2_VU_INLINE v4u vsplat(std::uint32_t x) { return v4u{x, x, x, x}; }
 PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old & ~mask); }
+// The lanes turned for OPMULA / OPMSUB: (y, z, x, w) and (z, x, y, w).
+PS2_VU_INLINE v4u vyzxw(v4u v) { return __builtin_shufflevector(v, v, 1, 2, 0, 3); }
+PS2_VU_INLINE v4u vzxyw(v4u v) { return __builtin_shufflevector(v, v, 2, 0, 1, 3); }
 // What the vector units do to every number they take in or give out: an exponent of 255 is an ordinary number that is cut
 // down to the largest float (0x7F7FFFFF), and a denormal becomes a zero with its sign.
 PS2_VU_INLINE v4u vfix_generic(v4u x) {
@@ -746,6 +751,13 @@ PS2_VU_INLINE v4u vftoi(v4u x, int fraction) {
     const __m128 big = _mm_cmpge_ps(f, _mm_set1_ps(2147483648.0f));
     return (v4u)_mm_xor_si128(t, _mm_castps_si128(big));
 }
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+// FCVTZS truncates and saturates: 0x7FFFFFFF from 2^31 up, 0x80000000 below -2^31 (and for -2^31), which is vftoi_generic's answer;
+// the NaN case (0) cannot happen, as vfix leaves no exponent of 255.
+PS2_VU_INLINE v4u vftoi(v4u x, int fraction) {
+    const v4f f = (v4f)vfix(x) * static_cast<float>(1u << fraction);
+    return (v4u)vcvtq_s32_f32((float32x4_t)f);
+}
 #else
 PS2_VU_INLINE v4u vftoi(v4u x, int fraction) { return vftoi_generic(x, fraction); }
 #endif
@@ -781,6 +793,17 @@ PS2_VU_INLINE void flags(Vu0Regs &r, const Reg128 &v, unsigned dest) {
     r.status = (status & ~0x30u) | (r.status & 0x30u);
 }
 
+// The MAC flags of all four lanes of a result, with vector compares and one OR across the lanes (no movemask outside x86): lane x
+// is bit 3 of each nibble. The same MAC as flags(r, Reg128, 15) (zero: exponent 0, sign: the sign bit, overflow: the largest
+// magnitude 0x7FFFFFFF); checked against it on random and special values.
+PS2_VU_INLINE std::uint32_t vmac(v4u v) {
+    const v4u zero = (v4u)((v & 0x7F800000u) == 0u);
+    const v4u sign = (v4u)((v4i)v < 0);
+    const v4u over = (v4u)((v & 0x7FFFFFFFu) == 0x7FFFFFFFu);
+    const v4u bits = (zero & v4u{8u, 4u, 2u, 1u}) | (sign & v4u{0x80u, 0x40u, 0x20u, 0x10u}) | (over & v4u{0x8000u, 0x4000u, 0x2000u, 0x1000u});
+    return __builtin_reduce_or(bits);
+}
+
 #if defined(__SSE2__)
 // The MAC and status flags of a result held in a register, from three movemasks. Lane x is bit 0 of a movemask and bit 3 of a
 // flag nibble, hence the table that turns four bits around. Same flags as the version above for the lanes in `dest`
@@ -802,9 +825,14 @@ PS2_VU_INLINE void flags(Vu0Regs &r, v4u v, unsigned dest) {
 }
 #else
 PS2_VU_INLINE void flags(Vu0Regs &r, v4u v, unsigned dest) {
-    Reg128 uf;
-    std::memcpy(&uf, &v, 16);
-    flags(r, uf, dest);
+    const std::uint32_t mac = vmac(v) & (dest | (dest << 4) | (dest << 12));
+    r.mac = mac;
+    std::uint32_t status = r.status & 0xFF0u;
+    if (mac & 0x000Fu) status |= 0x1u;
+    if (mac & 0x00F0u) status |= 0x2u;
+    if (mac & 0xF000u) status |= 0x8u;
+    status |= (status & 0xFu) << 6;
+    r.status = (status & ~0x30u) | (r.status & 0x30u);
 }
 #endif
 
@@ -948,11 +976,7 @@ struct FlagPipeV : FlagPipe {
         const unsigned over = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x7FFFFFFF)))));
         return kReverse4[zero] | (static_cast<std::uint32_t>(kReverse4[sign]) << 4) | (static_cast<std::uint32_t>(kReverse4[over]) << 12);
 #else
-        Vu0Regs t{};
-        Reg128 u;
-        std::memcpy(&u, &v, 16);
-        flags(t, u, 15u);
-        return t.mac;
+        return vmac(v);
 #endif
     }
     template <unsigned D>

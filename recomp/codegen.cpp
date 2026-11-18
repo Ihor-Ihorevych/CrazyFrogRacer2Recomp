@@ -1017,7 +1017,7 @@ private:
         case Vopmula: line(std::format("vu::{}(c.vu0, {}u, {}u);", vu_name("opmula"), i.fs(), i.ft())); break;
         case Vitof0: case Vitof4: case Vitof12: case Vitof15: {
             const int frac = i.op == Vitof0 ? 0 : i.op == Vitof4 ? 4 : i.op == Vitof12 ? 12 : 15;
-            line(std::format("vu::itof(c.vu0, {}u, {}u, {}u, {});", i.dest(), i.ft(), i.fs(), frac));
+            line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {});", vu0_old_ ? "itof" : "itof4", i.dest(), i.ft(), i.fs(), frac));
             break;
         }
         case Vftoi0: case Vftoi4: case Vftoi12: case Vftoi15: {

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #if defined(__SSE4_1__)
@@ -211,7 +212,76 @@ void run_vu(int unit, std::uint32_t address, const Ctx &c) {
     vu::run(unit, address);
 }
 
-#if defined(__SSE4_1__)
+#if !defined(PS2_VIF_VECTOR)
+#if defined(__clang__)
+#define PS2_VIF_VECTOR 1
+#else
+#define PS2_VIF_VECTOR 0
+#endif
+#endif
+
+#if PS2_VIF_VECTOR
+// One element of an UNPACK as the four words it becomes in the vector unit's memory, written with clang's vector types so the same
+// source becomes SSE on x86 and NEON on ARM (the phone): sign or zero extended, a one-component element repeated, a two-component
+// element as x y x y, a three-component one with w = 0. Reads exactly the bytes of the element (the last element of a command may end
+// the data), the lanes not read stay zero. Build with -DPS2_VIF_VECTOR=0 for the SSE4.1 intrinsics (x86) or the scalar loop.
+typedef std::uint32_t VifU4 __attribute__((ext_vector_type(4)));
+typedef std::int32_t VifI4 __attribute__((ext_vector_type(4)));
+
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+__attribute__((always_inline)) inline VifU4 unpack_element(const std::uint8_t *p) {
+    using Narrow = std::conditional_t<Bits == 32, std::uint32_t,
+                                      std::conditional_t<Bits == 16, std::conditional_t<Usn, std::uint16_t, std::int16_t>,
+                                                         std::conditional_t<Usn, std::uint8_t, std::int8_t>>>;
+    typedef Narrow NarrowV __attribute__((ext_vector_type(4)));
+    NarrowV e = {};
+    std::memcpy(&e, p, Components * sizeof(Narrow));
+    VifU4 w;
+    if constexpr (Bits == 32 || Usn) w = __builtin_convertvector(e, VifU4);
+    else w = (VifU4)__builtin_convertvector(e, VifI4);
+    if constexpr (Components == 1) return w.xxxx;
+    else if constexpr (Components == 2) return w.xyxy;
+    else return w;
+}
+
+template <std::uint32_t Mode>
+__attribute__((always_inline)) inline VifU4 apply_mode(VifU4 v, VifU4 &row) {
+    if constexpr (Mode == 1) {
+        return v + row;
+    } else if constexpr (Mode == 2) {
+        row = v + row;
+        return row;
+    } else {
+        if constexpr (Mode == 3) row = v;
+        return v;
+    }
+}
+
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn, std::uint32_t Mode>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num, std::uint32_t *row_regs) {
+    constexpr std::size_t stride = static_cast<std::size_t>(Components) * Bits / 8;
+    VifU4 row = {};
+    if constexpr (Mode != 0) std::memcpy(&row, row_regs, 16);
+    if (skip == 0) {
+        for (std::uint32_t n = 0; n < num; ++n) {
+            const VifU4 v = apply_mode<Mode>(unpack_element<Bits, Components, Usn>(bytes + n * stride), row);
+            std::memcpy(mem + static_cast<std::size_t>((addr + n) & mask) * 16, &v, 16);
+        }
+    } else {
+        std::uint32_t cycle = 0;
+        for (std::uint32_t n = 0; n < num; ++n) {
+            const VifU4 v = apply_mode<Mode>(unpack_element<Bits, Components, Usn>(bytes + n * stride), row);
+            std::memcpy(mem + static_cast<std::size_t>(addr & mask) * 16, &v, 16);
+            ++addr;
+            if (++cycle >= wl) {
+                addr += skip;
+                cycle = 0;
+            }
+        }
+    }
+    if constexpr (Mode >= 2) std::memcpy(row_regs, &row, 16);
+}
+#elif defined(__SSE4_1__)
 // One element of an UNPACK as the four words it becomes in the vector unit's memory: sign or zero extended, a one-component element
 // repeated, a two-component element as x y x y, a three-component one with w = 0. Reads exactly the bytes of the element (the last
 // element of a command may end the data), so it never looks past them.
