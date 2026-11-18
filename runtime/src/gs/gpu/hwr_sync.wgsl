@@ -1,6 +1,7 @@
 // ---- The hardware renderer's transfers between its targets and graphics memory (hwr.cpp). Appended to gs.wgsl, so it uses its memory
 // layout code (read_sample, write_sample). Parameters: prm(0) bp, prm(1) bw, prm(2) psm, prm(3), prm(4) x, y of the rectangle, prm(5), prm(6)
-// its size, prm(7) (depth only) the depth scale: zmax + 1 as f32 bits, prm(8) the targets' scale F (card texels per GS pixel, f32 bits).
+// its size, prm(7) (depth only) the depth scale: zmax + 1 as f32 bits, prm(8), prm(9) the targets' scale across and down (card texels per
+// GS pixel, f32 bits).
 //
 // Graphics memory keeps SCALE x SCALE samples per GS pixel (sample k = sub-row * SCALE + sub-column, at x + (column + 0.5) / SCALE); the
 // targets are drawn at F, which need not be SCALE (PS2_HWR_SCALE: any size, e.g. 1.35). Stores run one thread per memory sample and read
@@ -14,8 +15,8 @@ fn hwr_16bit(psm: u32) -> bool {
     return psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au;
 }
 
-fn hwr_scale() -> f32 {
-    return bitcast<f32>(prm(8u));
+fn hwr_scale() -> vec2<f32> {
+    return vec2<f32>(bitcast<f32>(prm(8u)), bitcast<f32>(prm(9u)));
 }
 
 // the target texel under memory sample (gid) of the rectangle
@@ -23,7 +24,7 @@ fn hwr_texel(gid: vec3<u32>, dim: vec2<u32>) -> vec2<i32> {
     let f = hwr_scale();
     let gx = f32(prm(3u)) + (f32(gid.x) + 0.5) / f32(SCALE);
     let gy = f32(prm(4u)) + (f32(gid.y) + 0.5) / f32(SCALE);
-    return vec2<i32>(min(vec2<u32>(u32(gx * f), u32(gy * f)), dim - vec2<u32>(1u, 1u)));
+    return vec2<i32>(min(vec2<u32>(u32(gx * f.x), u32(gy * f.y)), dim - vec2<u32>(1u, 1u)));
 }
 
 // graphics memory -> a colour target (a 16-bit pixel becomes 5 bits per channel in 8 and alpha 255 or 0 from its A bit)
@@ -31,13 +32,13 @@ fn hwr_texel(gid: vec3<u32>, dim: vec2<u32>) -> vec2<i32> {
 fn hwr_load(@builtin(global_invocation_id) gid: vec3<u32>) {
     let f = hwr_scale();
     let dim = textureDimensions(hwr_out);
-    let tx = u32(floor(f32(prm(3u)) * f)) + gid.x;
-    let ty = u32(floor(f32(prm(4u)) * f)) + gid.y;
+    let tx = u32(floor(f32(prm(3u)) * f.x)) + gid.x;
+    let ty = u32(floor(f32(prm(4u)) * f.y)) + gid.y;
     if (tx >= dim.x || ty >= dim.y) {
         return;
     }
-    let gx = (f32(tx) + 0.5) / f;
-    let gy = (f32(ty) + 0.5) / f;
+    let gx = (f32(tx) + 0.5) / f.x;
+    let gy = (f32(ty) + 0.5) / f.y;
     let x = u32(gx);
     let y = u32(gy);
     if (x < prm(3u) || y < prm(4u) || x >= prm(3u) + prm(5u) || y >= prm(4u) + prm(6u)) {

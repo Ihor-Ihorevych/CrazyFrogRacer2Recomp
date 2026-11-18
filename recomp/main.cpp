@@ -121,8 +121,24 @@ std::map<std::uint32_t, Toggle> read_toggles(const std::string &path) {
     return toggles;
 }
 
+// Aspect knobs (CodegenOptions::aspect_knobs): ADDRESS POWER per line, address hex, power a signed number; '#' starts a comment.
+std::map<std::uint32_t, int> read_aspect_knobs(const std::string &path) {
+    std::ifstream in(ps2::os::path(path));
+    if (!in) throw std::runtime_error("cannot read " + path);
+    std::map<std::uint32_t, int> knobs;
+    for (std::string text; std::getline(in, text);) {
+        text = text.substr(0, text.find('#'));
+        std::istringstream fields(text);
+        std::uint32_t address;
+        int power;
+        if (!(fields >> std::hex >> address >> std::dec >> power)) continue;
+        knobs[address] = power;
+    }
+    return knobs;
+}
+
 int usage() {
-    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--overlays dir] [--probes file] [--toggles file] [--out dir] [--stats]\n");
+    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--overlays dir] [--probes file] [--toggles file] [--aspect-knobs file] [--out dir] [--stats]\n");
     std::fprintf(stderr, "       eerecomp --live-image <captured.bin> --base <hex> --stamp <hex> --out <dir> [--entry <hex>]... [--expect-name <base_crc>] [--dense-checks]\n");
     return 2;
 }
@@ -200,7 +216,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    std::string elf_path = argv[1], entries_path, out, probes_path, toggles_path, modules_dir, overlays_dir;
+    std::string elf_path = argv[1], entries_path, out, probes_path, toggles_path, knobs_path, modules_dir, overlays_dir;
     bool stats = false;
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -209,6 +225,7 @@ int main(int argc, char **argv) {
         else if (arg == "--out" && i + 1 < argc) out = argv[++i];
         else if (arg == "--probes" && i + 1 < argc) probes_path = argv[++i];
         else if (arg == "--toggles" && i + 1 < argc) toggles_path = argv[++i];
+        else if (arg == "--aspect-knobs" && i + 1 < argc) knobs_path = argv[++i];
         else if (arg == "--modules" && i + 1 < argc) modules_dir = argv[++i];
         else if (arg == "--overlays" && i + 1 < argc) overlays_dir = argv[++i];
         else return usage();
@@ -338,6 +355,7 @@ int main(int argc, char **argv) {
             if (!probes_path.empty())
                 for (std::uint32_t a : read_entries(probes_path).main) options.probes.insert(a);
             if (!toggles_path.empty()) options.toggles = read_toggles(toggles_path);
+            if (!knobs_path.empty()) options.aspect_knobs = read_aspect_knobs(knobs_path);
             generate(translations, options);
         }
     } catch (const std::exception &error) {

@@ -89,6 +89,15 @@ public class SettingsPanel extends FrameLayout {
         TextView subtitle = text("Crazy Frog Racer 2 for Android", 13, DIM, false);
         subtitle.setGravity(Gravity.CENTER);
         col.addView(subtitle, margin(wrap(), 0, 2, 0, 0));
+        String version = "";
+        try {
+            version = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName;  // AndroidManifest.xml versionName
+        } catch (Exception e) { /* none shown */ }
+        if (version != null && !version.isEmpty()) {
+            TextView ver = text("Version " + version, 12, DIM, false);
+            ver.setGravity(Gravity.CENTER);
+            col.addView(ver, margin(wrap(), 0, 2, 0, 0));
+        }
         View spacer = new View(ctx);
         col.addView(spacer, new LinearLayout.LayoutParams(0, 0, 1f));
         col.addView(link(Icons.TELEGRAM, "Telegram group", TELEGRAM), match());
@@ -190,9 +199,7 @@ public class SettingsPanel extends FrameLayout {
     }
 
     private void updateResolution(int percent) {
-        float f = st.scaleFor(percent);
-        resolutionLabel.setText(String.format(java.util.Locale.US, "Resolution   %d%%   %.2fx   %d x %d", percent, f,
-            Math.round(640 * f), Math.round(512 * f)));
+        resolutionLabel.setText(String.format(java.util.Locale.US, "Resolution   %d%%   %d x %d", percent, st.pixelsX(percent), st.pixelsY(percent)));
         for (TextView chip : chips) {
             boolean on = (Integer) chip.getTag() == percent;
             chip.setBackground(round(on ? ACCENT : FIELD, 18));
@@ -210,7 +217,7 @@ public class SettingsPanel extends FrameLayout {
     private View screenSection() {
         LinearLayout box = section(Icons.SCREEN, "Screen");
         box.addView(text("Picture shape", 14, TEXT, false));
-        final Segmented mode = new Segmented(ctx, "Original 4:3", "Stretch", "Zoom");
+        final Segmented mode = new Segmented(ctx, "Original", "Stretch", "Zoom");
         mode.setSelected(st.display());
         mode.setListener(index -> {
             st.put("display", index);
@@ -219,6 +226,22 @@ public class SettingsPanel extends FrameLayout {
         box.addView(mode, margin(wrap(), 0, 6, 0, 0));
         box.addView(text("Stretch widens the picture to your screen. Zoom fills it and cuts the top and bottom.", 12, DIM, false),
                     margin(wrap(), 0, 8, 0, 0));
+        box.addView(text("Game view", 14, TEXT, false), margin(wrap(), 0, 10, 0, 0));
+        final Segmented view = new Segmented(ctx, "Widescreen", "4:3");
+        final boolean startWide = st.wide();
+        view.setSelected(startWide ? 0 : 1);
+        final TextView again = text("Restart the game to apply this. Tap here to restart now.", 12, ACCENT, true);
+        again.setOnClickListener(v -> host.restartGame());
+        view.setListener(index -> {
+            st.put("wide", index == 0);
+            again.setVisibility((index == 0) == startWide ? View.GONE : View.VISIBLE);
+            updateResolution(resolution.getValue());
+        });
+        box.addView(view, margin(wrap(), 0, 6, 0, 0));
+        box.addView(text("Widescreen: the camera sees as much as your screen is wide (the game's own widescreen patch, PCSX2). "
+                         + "4:3: the picture as on a TV.", 12, DIM, false), margin(wrap(), 0, 8, 0, 0));
+        box.addView(again, margin(wrap(), 0, 4, 0, 0));
+        again.setVisibility(View.GONE);
         return box;
     }
 

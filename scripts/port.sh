@@ -27,6 +27,9 @@ options:
   --pnach FILE       apply a PCSX2 patch file, repeatable; patches that land in
                      the executable are translated with it, the rest are
                      written into memory at boot or every frame
+  --aspect-pnach FILE  take the widescreen section of this PCSX2 patch file as aspect knobs (pnach.py knobs): the
+                     game's camera follows the screen's shape at run time (PS2_ASPECT=width:height), any shape, and
+                     stays 4:3 without it. Kept in games/<name>/aspect.txt for later runs.
   --pnach-section S  also apply the patches under [S] in those files, the way
                      enabling them in PCSX2 does; lines outside any section
                      always apply
@@ -42,7 +45,7 @@ name="$1"; source_path="$2"; shift 2
 if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$name" == .* ]]; then
   echo "game name '$name': use letters, digits, . _ and - only, not starting with a dot" >&2; exit 2
 fi
-frames=3600; rounds=8; explore=1; web=1; presses=(); pnach=(); wide=()
+frames=3600; rounds=8; explore=1; web=1; presses=(); pnach=(); wide=(); aspect_pnach=
 while [ $# -gt 0 ]; do
   case "$1" in
     --frames) frames="$2"; shift ;;
@@ -52,6 +55,7 @@ while [ $# -gt 0 ]; do
     --native-only) web=0 ;;
     --pnach) [ -f "$2" ] || { echo "$2: no such file" >&2; exit 1; }; pnach+=("$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"); shift ;;
     --pnach-section) pnach=(--section "$2" "${pnach[@]}"); shift ;;
+    --aspect-pnach) [ -f "$2" ] || { echo "$2: no such file" >&2; exit 1; }; aspect_pnach="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift ;;
     --widescreen) wide=(--widescreen) ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -169,6 +173,16 @@ fi
 echo "${elf#$ROOT/}"
 toggles=()
 [ ! -f "$game/toggles.txt" ] || toggles=(--toggles "$game/toggles.txt")  # instructions a patch switches at run time (pnach.py)
+if [ -n "$aspect_pnach" ]; then
+  if "${py[@]}" -I "$here/pnach.py" knobs "$elf" "$aspect_pnach" > "$game/aspect.txt.new"; then
+    mv "$game/aspect.txt.new" "$game/aspect.txt"
+    echo "aspect knobs (the camera follows the screen's shape): $(grep -c . "$game/aspect.txt")"
+  else
+    rm -f "$game/aspect.txt.new"
+    echo "$aspect_pnach: its widescreen section is not only lui constants, so it cannot follow the screen; use --pnach for a fixed 16:9" >&2
+  fi
+fi
+[ ! -f "$game/aspect.txt" ] || toggles+=(--aspect-knobs "$game/aspect.txt")  # constants scaled by PS2_ASPECT at run time
 modules=()
 if grep -q SNR2 "$elf" || grep -qa xff2 "$elf"; then
   "${py[@]}" -I "$here/disc.py" modules "$iso" "$game/modules"

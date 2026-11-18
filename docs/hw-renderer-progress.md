@@ -162,3 +162,97 @@ Emulation thread: EE code + IOP. vu1: compiled VU1 programs ~70 % of its work.
 60 Hz: the disc is PAL (50 Hz; 50 fps is full speed). `--ntsc` runs the machine at 60 Hz, but the game keeps its 512-line PAL picture
 and the NTSC display shows ~425 lines (the bottom HUD is cut), and whether the game's logic is per frame (then 20 % too fast) is not
 settled. Not offered.
+
+## Phone at high resolution: the picture shown straight from the target (2026-11-18)
+
+First phone measurements of the hw renderer (Xiaomi 2311DRK48G, Mali-G615; PS2_PROF / PS2_SPEED_LOG / PS2_FRAME_GPU_MS, logs in
+`C:\Users\Ihor\CFR2Recomp\perf\s1`, `s2`): at 40 % (targets 0.94x, memory 1x) a steady 50 fps with the processor threads idle in the
+limiter ~75 % of the time; at 80 % (targets 1.69x, memory 2x) 36-44 fps everywhere, menus included, the window thread waiting in present
+70-90 % and the card busy 25-30 ms per frame even for menu frames of 2 draws. Not the drawing: fixed per-frame work. Mali's render-pass
+timestamps read ~0 (not usable there).
+
+Changes (all PS2_RENDERER=hw unless noted):
+* **Present pass reads a texture** (blit.wgsl, all renderers): `prep_mem` / `prep_tex` write the field (or the blend of the two latest
+  fields) once per presented frame into an RGBA8 texture; the present pass reads it with textureLoad and the card's bilinear filter. Before,
+  every screen pixel (~2.7 M) read the fields from a storage buffer, both fields, up to ~70 reads for the default sharp_edges look.
+* **Display straight from the target** (`hwr::display_target` / `hwr::show`, op kOpShow): the displayed rectangle of the target is copied
+  (card texels) into a field texture; no store to memory and no display kernel. Overlay circuit, live mode or no matching target: the
+  memory path as before. `PS2_HWR_PRESENT=memory` turns it off. At 1x the prepared picture is identical to the memory path's (row k = memory
+  row 2k: 0 of 391 680 values differ, race frame 3650).
+* **Surfaces without storage usage**: loads (memory -> new target) go through a staging texture and a copy, so tile GPUs can compress the
+  render targets (Mali turns AFBC off for storage textures). Race 3400-4400 headless: frames and end state byte-identical.
+* App: PS2_SCALE (graphics memory) is 1 always; the resolution setting only sets PS2_HWR_SCALE.
+* Debug: `PS2_PRESENT_DUMP=<frame>,<file>` writes that frame's prepared picture (PPM).
+
+## Widescreen at the screen's shape and the screen's own resolution (2026-11-18)
+
+* **Aspect knobs** (eerecomp `--aspect-knobs games/<name>/aspect.txt`, `pnach.py knobs <elf> <pnach>`, port.sh `--aspect-pnach FILE`): a
+  widescreen patch whose lines all replace `lui` float constants becomes knobs: the translation loads `aspect_word(constant, power)`
+  (generated.hpp), the constant times r^power with r = PS2_ASPECT / (4:3), the constant itself without PS2_ASPECT. CFR2: Arapapa's 16:9
+  patch from PCSX2's repository (SLES-54549_31E4639D.pnach): zoom 0047F2C8 r^-1, vertical field of view 0046C7AC r^1, HUD scale 0046CCB0
+  r^-1; full float precision (the patch keeps 16 bits). Without PS2_ASPECT race frames and end state byte-identical. The HUD stays in the
+  4:3 middle (the patch's HUD fix scales it, it does not move it to the edges). The display layout uses 4:3 x r as the picture's shape.
+* **Across and down apart** (`PS2_HWR_SCALE` across, `PS2_HWR_SCALE_Y` down; hwr card_x / card_y, sync and target-read shaders take
+  both): CFR2 draws 512 x 256 fields shown on all lines, so a screen of W x H pixels needs W / 512 across and H / 256 down. 1x: race frames
+  and end state byte-identical. 2712:1220 at 5.297 x 4.766: the prepared picture is 2712 x 1215.
+* App: resolution in percent of the screen's own pixels (100 % = one texel per screen pixel), "Game view: Widescreen / 4:3" (default
+  widescreen; PS2_ASPECT = the real screen size).
+
+## The screen's own resolution: what it costs and two cuts (2026-11-18)
+
+Phone at 2712 x 1215 (5.297 x 4.766): ~20-22 fps, the card the limit everywhere (menus 20.0-20.4 fps). PC at the same scale (RTX 4050,
+race 3400-3800): attachment loads ~290 MB and stores ~360 MB per frame, render passes 2.5-3.2 ms, the display copy (F800 -> F0, 16 strips
+read with the scaled bilinear path: four texel loads through the GS wrap each) 0.64-0.82 ms, the glow ladder 4 x ~0.2 ms.
+* **Target reads through the card's filter** (hwr.wgsl sample_loads): a bilinear read of a target at another scale, view 0 (its own
+  colours), clamp (or region clamp over the whole texture) or repeat over a texture of the target's size: one textureSampleLevel with a
+  bilinear clamp / repeat sampler (tex group bindings 2, 3) instead of four loads. Display copy 0.64-0.82 -> 0.32 ms. Colours may differ by 1.
+* **Effect buffers at a smaller scale** (hwr `sx_of` / `sy_of`; `PS2_HWR_SMALL_SCALE`, default 2, 0 = off): targets narrower than 512 GS
+  pixels (glow 256, blur and shadow 64) at most 2x across. Glow passes ~0.2 -> 0.03-0.1 ms; attachment traffic 32 MB loaded + 109 MB stored
+  per frame. Render passes 2.0 ms, card 2.7 ms per frame. 1x race byte-identical (the cut applies only above 2x).
+
+Second round (phone at 100 %: 20 fps everywhere, 80 %: 30-34 fps; `dumpsys thermalservice` during play: CPU/GPU 87 C, status severe,
+skin 51 C: the card runs throttled, so card work is heat as much as time):
+* **Targets as tall as their first draw's scissor** (rounded up to 32 rows; `PS2_HWR_FULL_HEIGHT=1` = 512 as before): every texel of a
+  render pass is loaded and stored by a tile GPU whether drawn or not. CFR2: display buffer 512x256, frame 512x384 (were 512x512). A draw
+  below makes the target 512 rows (`grow`: colour copied into the new surface, depth not kept).
+* **Frame rows capped at the screen's** (`PS2_HWR_ROWS`, the app gives screen rows x resolution): a frame-wide target whose first scissor
+  ends at row r gets at most ROWS / r texels per GS row down. CFR2's 384-row frame (squeezed into the 256-row field) at 3.18 instead of 4.77.
+* **Depth buffer shared by targets of two scales** (frame and display copy share Z 1400): a draw that only writes depth into a buffer held at
+  another scale drops its depth writes (approx "depth write dropped"); one that tests depth gets its own buffer. Before, the two evicted
+  each other every frame.
+* **Dead loads**: a load into a surface that nothing uses and no target holds after it (made over current memory, then cleared) is not
+  scheduled (approx "load not done").
+* **Present without a prepare pass**: a target shown straight is not blended with the field before (`PS2_FIELD_BLEND=1` blends), the present
+  pass reads the field copy itself; a picture of the screen's size is read once (no sharp / edge-smoothing passes at 1:1).
+Race at 2712 x 1215 (PC): attachments 18 MB loaded + 56 MB stored per frame (290 + 360 before the first round), card 2.0-2.3 ms
+(3.0). 1x race frames and end state byte-identical.
+
+## Measured on the phone (2026-11-18): where the card time goes
+
+`PS2_GPU_SWEEP=1` (gpu.cpp; with PS2_FRAME_GPU_MS's wait, now also after the present submit): every 8 s another part is left out, one
+line per part. Race (race.state auto-loaded by the app), 80 % (4.24 x 3.81, 2170 x 976 on a 2712 x 1220 screen):
+| | all | no draws | no render passes | no present picture |
+|---|---|---|---|---|
+| before | 32-33 ms | 19.3 | 19.0 | 18.4-18.9 |
+| plain present (below) | 19-19.6 ms | 8.5 | 7.8 | 18.2-19.2 |
+The present pass cost as much as the game's drawing (~13 ms): at a picture smaller than the screen the sharp_edges look read 20-40
+pixels per screen pixel, plus the prepare pass for the field blend. Now a picture with 60 % to 106 % of the screen's pixels each way is
+read once per field (bilinear) and the two latest fields are blended in the present pass itself (blend word 2): the game moves every
+other field by half a line (measured: 2 rows at 4x), which jumped when shown unblended.
+Phone fps (race, no measuring): 80 % 50.0 steady (emulation thread 63-69 % in the limiter); 100 % (2712 x 1215) 45-47 (was 20-22).
+* **Draw parameters as flat varyings** (hwr.wgsl): the vertex stage reads the draw's 13 parameter words once per corner and passes them
+  flat; the fragment stage no longer reads the storage buffer at every pixel (twice). 1x race byte-identical.
+  Phone sweep at 100 % (2712 x 1215), race: all 22-23 ms, no draws 8.5, no render passes 8.0, no present picture 21.4-22.3, no compute
+  (`E`, new) 20.2-21.1. Phone fps without measuring: **50.0 steady at 100 %** (emulation thread ~60 % in the limiter).
+
+## Movies (2026-11-18)
+
+Phone, intro movie at 100 %: 16-29 fps; sweep with 2 s parts (`PS2_GPU_SWEEP_S=2`): card only ~12 ms per frame, the window thread busy in
+the driver (present 41-61 %, submit 18-38 %). PC count: 16 825 submits in 420 movie frames (40 a frame; a race: 6). Cause: gpu.cpp
+queue_upload's content cache submits when its ring wraps while the pending submit reads the oldest entry; a movie's picture comes as
+hundreds of small uploads a frame, many alike (seen twice -> cached), so the ring wrapped ~40 times a frame. Now at most one such submit a
+frame (`g_ring_submits`, reset in flush); later uploads take the per-submit buffer. Movie run: 791 submits (2 a frame); movie frames
+(power-on 0-1200 every 50) and the 1x race byte-identical to the build before.
+Also: hwr texture cache entries unused for 50 frames are recycled by size (texture, view and groups kept) instead of making a texture per
+movie picture. Debug: `[gpu] submits by site` at exit.
+App version 1.1 (AndroidManifest versionName, versionCode 2), shown under the title in the settings.

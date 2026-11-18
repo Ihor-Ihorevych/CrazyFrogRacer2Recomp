@@ -745,6 +745,11 @@ void reboot(std::uint32_t src) {
     std::memcpy(&cid, packet + 8, 4);
     std::memcpy(&args_size, packet + 16, 4);
     std::memcpy(&mode, packet + 20, 4);
+    if (cid != kCmdReset) {  // data the game streams to IOP address 0 (thousands of times while it plays): not a reset, said three times
+        static unsigned told = 0;
+        if (told < 3) std::fprintf(stderr, "[sif] a transfer to IOP address 0 carries command 0x%08X, not a reset%s\n", cid, ++told == 3 ? " (not reported again)" : "");
+        return;
+    }
     const std::string path(reinterpret_cast<const char *>(packet + 24), strnlen(reinterpret_cast<const char *>(packet + 24), std::min<std::uint32_t>(args_size, 80)));
     std::fprintf(stderr, "[sif] IOP reboot requested with \"%s\"\n", path.c_str());
     if (path.find("IOPRP") != std::string::npos) g_fileio_async = true;
@@ -752,10 +757,6 @@ void reboot(std::uint32_t src) {
     std::string image = path;
     if (image.rfind("rom0:UDNL", 0) == 0) image.erase(0, 9);
     image.erase(0, image.find_first_not_of(' '));
-    if (cid != kCmdReset) {
-        std::fprintf(stderr, "[sif] that transfer to IOP address 0 carries command 0x%08X, not a reset\n", cid);
-        return;
-    }
     if (!image.empty()) {
         begin_boot();
         return;

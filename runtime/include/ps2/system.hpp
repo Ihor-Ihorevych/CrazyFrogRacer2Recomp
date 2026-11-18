@@ -88,6 +88,7 @@ struct Options {
 };
 
 extern Options g_options;
+extern float g_aspect_widen;  // PS2_ASPECT over 4:3 (system.cpp; the aspect knobs, generated.hpp aspect_word)
 
 struct ThreadContext {
     Reg128 r[32];

@@ -39,6 +39,9 @@ struct Context {
 };
 
 bool requested();  // PS2_RENDERER=hw
+// PS2_GPU_SWEEP=1 (gpu.cpp): what is left out now to measure it: 0 nothing, 1 the render passes' draws, 2 the render passes, 3 the present pass's
+// picture (a measuring aid: the picture is wrong in 1 to 3)
+extern int g_sweep;
 extern bool g_on;  // set by init when the renderer runs
 bool init(const Context &ctx);
 
@@ -56,6 +59,11 @@ void pre_blocks(bool clut, const std::uint32_t *rec, std::vector<std::uint32_t> 
 void local_copy(std::uint32_t dbp, std::uint32_t dbw, std::uint32_t dpsm, int x0, int y0, int x1, int y1);
 // the display reads this rectangle of memory at this point of the stream: the target holding it is written back first
 void before_display(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h);
+// The display shown straight from a target (no write-back to memory, no display kernel): display_target finds the colour target that holds
+// this rectangle of memory (the first pixel's page, same base and width) and gives the size of its picture in card texels; show then records
+// the copy of that picture into `dst` (at 0, 0), after the draws that made it. PS2_HWR_PRESENT=memory turns it off (display_target false).
+bool display_target(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, std::uint32_t &card_w, std::uint32_t &card_h);
+void show(WGPUTexture dst);
 // all targets go back to graphics memory (save states, downloads)
 void sync_all();
 // graphics memory was replaced (state load): every target and the identities are dropped

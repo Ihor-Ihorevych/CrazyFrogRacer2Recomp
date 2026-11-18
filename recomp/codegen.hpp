@@ -27,6 +27,10 @@ struct CodegenOptions {
     std::uint32_t unit_bits = 14;
     std::set<std::uint32_t> probes;
     std::map<std::uint32_t, Toggle> toggles;
+    // Aspect knobs: a `lui` whose constant (a float's upper half) the runner scales by the screen's widening r = screen aspect / (4:3) to the
+    // power given (games/<name>/aspect.txt; the camera's zoom and field of view of a widescreen patch). The code loads
+    // ps2::aspect_word(constant, power): the constant itself while r is 1.
+    std::map<std::uint32_t, int> aspect_knobs;
     // Not 0: the translation becomes a loadable library of the runner (runtime/src/ee_live.cpp) and table.cpp exports its
     // ps2_ee_live_stamp() and ps2_ee_live_init() instead of register_generated_code().
     std::uint64_t live_stamp = 0;

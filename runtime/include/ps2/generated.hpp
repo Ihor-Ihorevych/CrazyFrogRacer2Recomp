@@ -78,6 +78,18 @@ inline void fpu_compare(Cpu &c, bool condition) {
 
 inline std::uint32_t vu0_addr(std::uint32_t vi) { return (vi & 0xFFu) * 16u; }
 
+// Aspect knobs (eerecomp --aspect-knobs): the float `bits` times the screen's widening (g_aspect_widen = screen aspect / (4:3), set from
+// PS2_ASPECT) to the power `power`. While the widening is 1 (the game's own 4:3 picture) the constant is returned as it is.
+extern float g_aspect_widen;
+inline std::uint32_t aspect_word(std::uint32_t bits, int power) {
+    const float r = g_aspect_widen;
+    if (r == 1.0f || power == 0) return bits;
+    float f = __builtin_bit_cast(float, bits);
+    for (int k = 0; k < power; ++k) f *= r;
+    for (int k = 0; k > power; --k) f /= r;
+    return __builtin_bit_cast(std::uint32_t, f);
+}
+
 inline void lqc2_vu(Cpu &c, unsigned dest, unsigned ft, std::uint32_t vi) {
     Reg128 data;
     __builtin_memcpy(&data, vu0_data() + vu0_addr(vi), 16);

@@ -12,13 +12,15 @@
 struct D {
     a: vec4<u32>,  // flags, modes (tfx 0-1, atst 2-4, wms 8-9, wmt 10-11, source view 12-13), aref, fog colour
     b: vec4<u32>,  // tw | th << 8 (log2), minu | maxu << 16, minv | maxv << 16, ta0 | ta1 << 8
-    c: vec4<u32>,  // mipmap word (gpu.cpp make_mip word 0), levels - 1, FIX, a target source's card texels per GS texel (f32 bits, 0 = 1)
-    d: vec4<u32>,
+    c: vec4<u32>,  // mipmap word (gpu.cpp make_mip word 0), levels - 1, FIX, a target source's card texels per GS texel across (f32 bits, 0 = 1)
+    d: vec4<u32>,  // the same down (f32 bits)
 }
 
 @group(0) @binding(0) var<storage, read> draws: array<D>;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var smp: sampler;
+@group(1) @binding(2) var smp_clamp: sampler;   // bilinear, clamp to edge
+@group(1) @binding(3) var smp_repeat: sampler;  // bilinear, repeat
 
 override TEX: u32 = 0u;
 override ATEST: u32 = 0u;
@@ -49,12 +51,17 @@ struct VIn {
     @location(5) di: u32,
 }
 
+// The draw's parameters reach the fragment stage as flat values read once per corner (vs), not from the storage buffer at every pixel:
+// tile GPUs (Mali) are slow at per-pixel buffer reads.
 struct VOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) col: vec4<f32>,
     @location(1) stq: vec3<f32>,
     @location(2) fog: f32,
-    @location(3) @interpolate(flat) di: u32,
+    @location(3) @interpolate(flat) da: vec4<u32>,
+    @location(4) @interpolate(flat) db: vec4<u32>,
+    @location(5) @interpolate(flat) dc: vec4<u32>,
+    @location(6) @interpolate(flat) dd: u32,
 }
 
 @vertex
@@ -64,7 +71,11 @@ fn vs(v: VIn) -> VOut {
     o.col = v.col;
     o.stq = v.stq;
     o.fog = v.fog;
-    o.di = v.di;
+    let d = draws[v.di];
+    o.da = d.a;
+    o.db = d.b;
+    o.dc = d.c;
+    o.dd = d.d.x;
     return o;
 }
 
@@ -135,18 +146,37 @@ fn sample_loads(d: D, u: f32, v: f32) -> vec4<f32> {
     let maxv = d.b.z >> 16u;
     if (d.c.w != 0u) {  // a target drawn at another size than the GS's (PS2_HWR_SCALE): read its own texels (point: the one under the pixel;
                         // bilinear: between its texels)
-        let f = bitcast<f32>(d.c.w);
-        if ((d.a.x & F_BILINEAR) == 0u) {
-            return fetch(d, scaled_tap(u, f, sw, mu, minu, maxu), scaled_tap(v, f, sh, mv, minv, maxv));
+        let fx = bitcast<f32>(d.c.w);
+        let fy = bitcast<f32>(d.d.x);
+        // Fast path (the display copy, the glow and blur passes): the target's own colours (no 24/16-bit view), wrapped by clamp or repeat
+        // over the whole texture, filtered by the card in one read instead of four texel loads through the GS's wrap. The card's filter
+        // weights have fewer bits than the GS's: a colour may differ by 1.
+        let view = (d.a.y >> 12u) & 3u;
+        let whole_u = mu == 1u || (mu == 2u && minu == 0u && maxu >= u32(sw) - 1u);
+        let whole_v = mv == 1u || (mv == 2u && minv == 0u && maxv >= u32(sh) - 1u);
+        let dim = vec2<f32>(textureDimensions(tex));
+        let repeat_whole = mu == 0u && mv == 0u && abs(dim.x - round(f32(sw) * fx)) < 1.0 && abs(dim.y - round(f32(sh) * fy)) < 1.0;
+        if (view == 0u && (d.a.x & F_BILINEAR) != 0u && ((whole_u && whole_v) || repeat_whole)) {
+            let at = vec2<f32>(u * fx, v * fy) / dim;
+            var c: vec4<f32>;
+            if (mu == 0u) {
+                c = textureSampleLevel(tex, smp_repeat, at, 0.0);
+            } else {
+                c = textureSampleLevel(tex, smp_clamp, at, 0.0);
+            }
+            return floor(c * 255.0 + vec4<f32>(0.5));
         }
-        let hu = u * f - 0.5;
-        let hv = v * f - 0.5;
+        if ((d.a.x & F_BILINEAR) == 0u) {
+            return fetch(d, scaled_tap(u, fx, sw, mu, minu, maxu), scaled_tap(v, fy, sh, mv, minv, maxv));
+        }
+        let hu = u * fx - 0.5;
+        let hv = v * fy - 0.5;
         let hx = floor(hu);
         let hy = floor(hv);
-        let xa = scaled_tap((hx + 0.5) / f, f, sw, mu, minu, maxu);
-        let xb = scaled_tap((hx + 1.5) / f, f, sw, mu, minu, maxu);
-        let ya = scaled_tap((hy + 0.5) / f, f, sh, mv, minv, maxv);
-        let yb = scaled_tap((hy + 1.5) / f, f, sh, mv, minv, maxv);
+        let xa = scaled_tap((hx + 0.5) / fx, fx, sw, mu, minu, maxu);
+        let xb = scaled_tap((hx + 1.5) / fx, fx, sw, mu, minu, maxu);
+        let ya = scaled_tap((hy + 0.5) / fy, fy, sh, mv, minv, maxv);
+        let yb = scaled_tap((hy + 1.5) / fy, fy, sh, mv, minv, maxv);
         let top = mix(fetch(d, xa, ya), fetch(d, xb, ya), hu - hx);
         let bottom = mix(fetch(d, xa, yb), fetch(d, xb, yb), hu - hx);
         return floor(clamp(mix(top, bottom, hv - hy) + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
@@ -205,7 +235,7 @@ struct Shaded {
 }
 
 fn shade(in: VOut) -> Shaded {
-    let d = draws[in.di];
+    let d = D(in.da, in.db, in.dc, vec4<u32>(in.dd, 0u, 0u, 0u));
     let flags = d.a.x;
     let modes = d.a.y;
     let cf = floor(in.col * 255.0 + vec4<f32>(0.002));
@@ -333,7 +363,7 @@ fn shade(in: VOut) -> Shaded {
 fn fs(in: VOut) -> @location(0) vec4<f32> {
     let s = shade(in);
     var oa = s.alpha / 255.0;
-    if ((draws[in.di].a.x & F_ALPHA_FACTOR) != 0u) {
+    if ((in.da.x & F_ALPHA_FACTOR) != 0u) {
         oa = s.factor;
     }
     return vec4<f32>(s.rgb / 255.0, oa);

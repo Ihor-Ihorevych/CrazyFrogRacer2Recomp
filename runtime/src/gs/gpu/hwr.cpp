@@ -34,6 +34,7 @@ extern const char kHwrSyncShader[];
 namespace ps2::gs::gpu::hwr {
 
 bool g_on = false;
+int g_sweep = 0;
 
 bool requested() {
     static const bool on = os::env("PS2_RENDERER") == "hw";
@@ -50,10 +51,35 @@ Context C;
 u32 g_s = 1;  // PS2_SCALE (C.scale): samples per GS pixel each way in graphics memory
 // PS2_HWR_SCALE (C.target_scale): card texels per GS pixel of the targets (fractional allowed); hwr's bookkeeping stays in GS pixels and only
 // card sizes, scissors and copies are scaled. The sync programs resample between targets and memory (hwr_sync.wgsl).
-float g_f = 1.0f;
-u32 g_f_bits = 0x3F800000u;
-inline u32 card(u32 v) { return std::max<u32>(1u, static_cast<u32>(std::lround(static_cast<double>(v) * g_f))); }  // a GS length in card texels
-inline u32 card_at(u32 v) { return static_cast<u32>(std::lround(static_cast<double>(v) * g_f)); }                    // a GS position in card texels
+// across (x) and down (y) apart: a game that draws half-height fields (512 x 256 shown on 512 lines) fills a screen with about twice the
+// texels per GS pixel down that it needs across (PS2_HWR_SCALE_Y; unset: the same as across)
+float g_fx = 1.0f, g_fy = 1.0f;
+// Targets narrower than the frame (effect buffers: glow, blur, shadow; the frame and the display are 512 or more) are drawn at a smaller
+// scale, at most PS2_HWR_SMALL_SCALE across (default 2; 0 = the full scale): their pictures are blurred or small on screen, and at a
+// phone's own resolution they cost as much card time as the frame. A target's scale depends on its width only, so a colour target and the
+// depth target found for it (same size) always match.
+constexpr u32 kSmallWidth = 512;
+float g_small = 1.0f;  // the factor of the small targets' scale to the full one (<= 1)
+// PS2_HWR_ROWS: the screen's rows the picture fills (the app gives them). A frame-wide target whose first draw's scissor ends at row r is
+// drawn at most rows / r card texels per GS row down: the game's 384-row frame that it squeezes into a 256-row field then has the screen's
+// rows, not 1.5 times them (the rows past r still exist, at that scale). 0: no cap.
+float g_rows = 0.0f;
+// a target's card texels per GS pixel across and down (fixed for its life; its surfaces have it)
+struct Sc {
+    float x = 1.0f, y = 1.0f;
+    bool operator==(const Sc &o) const { return x == o.x && y == o.y; }
+};
+inline Sc base_scale(u32 tw) { return tw < kSmallWidth ? Sc{g_fx * g_small, g_fy * g_small} : Sc{g_fx, g_fy}; }
+inline u32 fbits(float f) {
+    u32 b;
+    std::memcpy(&b, &f, 4);
+    return b;
+}
+// a GS length / position in card texels at scale `c`
+inline u32 card_x(u32 v, const Sc &c) { return std::max<u32>(1u, static_cast<u32>(std::lround(static_cast<double>(v) * c.x))); }
+inline u32 card_y(u32 v, const Sc &c) { return std::max<u32>(1u, static_cast<u32>(std::lround(static_cast<double>(v) * c.y))); }
+inline u32 card_at_x(u32 v, const Sc &c) { return static_cast<u32>(std::lround(static_cast<double>(v) * c.x)); }
+inline u32 card_at_y(u32 v, const Sc &c) { return static_cast<u32>(std::lround(static_cast<double>(v) * c.y)); }
 bool g_log = false;
 
 WGPUStringView sv(const char *s) { return WGPUStringView{s, std::strlen(s)}; }
@@ -155,15 +181,16 @@ u64 g_epoch = 1;          // bumped whenever an upload, a palette load or a chan
 // ---------------------------------------------------------------- counters
 enum Reason { kPrimKind, kDate, kFramePsm, kFbmsk, kBlend, kPabe, kNoDual, kTexTarget, kZeroWidth, kReasons };
 const char *const kReasonName[kReasons] = {"lines/points", "DATE", "frame format", "partial frame mask", "blend form", "PABE", "no dual-source", "texture in a target (other layout)", "fbw 0"};
-enum Approx { kOutside, kStaleTex, kColclamp, kRegionMip, kAfx, kApproxes };
-const char *const kApproxName[kApproxes] = {"outside target", "stale texture memory", "colour wrap", "mip with region clamp", "As > 0x80"};
+enum Approx { kOutside, kStaleTex, kColclamp, kRegionMip, kAfx, kDepthScale, kDeadLoad, kApproxes };
+const char *const kApproxName[kApproxes] = {"outside target", "stale texture memory", "colour wrap", "mip with region clamp", "As > 0x80",
+                                            "depth write dropped (other scale)", "load not done (cleared)"};
 
 struct Counters {
     u64 shapes = 0, drawn = 0, skipped = 0, clears = 0;
     u64 fallback[kReasons] = {}, approx[kApproxes] = {};
     u64 draws = 0, passes = 0, pipelines = 0, groups = 0, vertices = 0;
     u64 lookups = 0, hits = 0, misses = 0, decoded_texels = 0, target_reads = 0, self_copies = 0, loads = 0, stores = 0, targets_made = 0;
-    u64 nodes = 0, renames = 0, surfaces_made = 0, copy_bytes = 0, overwrites = 0, dead_depth = 0;
+    u64 nodes = 0, renames = 0, surfaces_made = 0, copy_bytes = 0, overwrites = 0, dead_depth = 0, dead_loads = 0, grown = 0, recycled = 0;
     u64 att_loads = 0, att_stores = 0, att_load_bytes = 0, att_store_bytes = 0;  // render pass attachments that are loaded / stored (tile memory traffic)
     double cpu_ms = 0, sched_ms = 0;
 };
@@ -179,8 +206,9 @@ bool g_dump_now = false;      // PS2_HWR_DUMP=<frame>: this frame's shapes and s
 struct Surf {
     WGPUTexture tex = nullptr;
     WGPUTextureView view = nullptr;
-    WGPUBindGroup sample_group = nullptr, sync_group = nullptr, load_group = nullptr;
+    WGPUBindGroup sample_group = nullptr, sync_group = nullptr;
     u32 w = 0, h = 0;
+    Sc sc;
     bool depth = false;
     bool retired = false;  // no target holds it: its content is not needed after its last use in this submit
     u64 id = 0;            // resource identity for the dependency graph (new for every use as a new picture)
@@ -200,6 +228,7 @@ struct Target {
     u32 last_psm = 0;             // the format last drawn (CT24 keeps the top byte when written back)
     bool depth = false, alive = true;
     u32 w = 0, h = 0, zmax = 0;
+    Sc sc;                        // card texels per GS pixel (its surfaces')
     Surf *s = nullptr;            // the surface with the current picture
     u32 pages = 0;
     int valid_w = 0, valid_h = 0;
@@ -222,7 +251,13 @@ struct TexEntry {
     u32 levels = 1, bytes = 0;
     u64 last_frame = 0;
     u64 id = 0;  // resource id (the copies that fill it and the draws that read it)
+    u64 dims = 0;  // size and levels: which entries a recycled one can stand for
 };
+// Entries not used for a second go here (by size) and are filled again for a new texture of that size: a movie's picture is a new texture
+// every frame, and making a card texture, its view and groups each frame cost the phone's driver more than the decode (texture_recycle).
+std::unordered_map<u64, std::vector<std::unique_ptr<TexEntry>>> g_tex_free;
+constexpr std::size_t kFreePerSize = 16;
+constexpr u64 kRecycleFrames = 50;
 std::unordered_map<u64, std::unique_ptr<TexEntry>> g_cache;
 u64 g_cache_bytes = 0, g_cache_budget = 256ull << 20;
 
@@ -250,7 +285,7 @@ constexpr u64 kKeyOn = 1ull << 63;
 
 // The submit's work in stream order. Passes ("nodes": a run of draws into one colour surface and at most one depth surface) and copies are
 // reordered at submit time (schedule()); loads and stores of graphics memory keep their place among gpu.cpp's compute commands.
-enum OpKind : u8 { kOpPass, kOpCopyLevel, kOpLoad, kOpStore, kOpStoreZ, kOpSelfCopy };
+enum OpKind : u8 { kOpPass, kOpCopyLevel, kOpLoad, kOpStore, kOpStoreZ, kOpSelfCopy, kOpShow };
 struct Op {
     OpKind kind;
     u32 pos;
@@ -264,6 +299,7 @@ struct Op {
     WGPUTexture tex = nullptr, tex2 = nullptr;
     WGPUBindGroup group = nullptr;
     u32 level = 0, w = 0, h = 0, offset = 0, pitch = 0, param = 0;
+    Sc sc;               // the target's scale (self copies, loads)
     u64 rd = 0, wr = 0;  // resource read / written (copies, loads, stores)
 };
 
@@ -423,15 +459,20 @@ WGPUSampler sampler(u32 idx) {
     return g_samplers[idx];
 }
 
+// bindings 2 and 3: bilinear with clamp and with repeat, for a target read as a texture at another scale (hwr.wgsl sample_loads' fast path)
 WGPUBindGroup tex_group(WGPUTextureView view, u32 sampler_idx) {
-    WGPUBindGroupEntry e[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    WGPUBindGroupEntry e[4] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     e[0].binding = 0;
     e[0].textureView = view;
     e[1].binding = 1;
     e[1].sampler = sampler(sampler_idx);
+    e[2].binding = 2;
+    e[2].sampler = sampler(1 | 2 | 8 | 16);
+    e[3].binding = 3;
+    e[3].sampler = sampler(1 | 2);
     WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     d.layout = g_tex_layout;
-    d.entryCount = 2;
+    d.entryCount = 4;
     d.entries = e;
     return wgpuDeviceCreateBindGroup(C.device, &d);
 }
@@ -491,10 +532,10 @@ Op &add_op(OpKind kind) {
 }
 
 // a surface from the pool (or a new one); it gets a new resource id
-Surf *get_surf(u32 w, u32 h, bool depth) {
+Surf *get_surf(u32 w, u32 h, bool depth, const Sc &sc) {
     Surf *s = nullptr;
     for (std::size_t k = 0; k < g_pool.size(); ++k)
-        if (g_pool[k]->w == w && g_pool[k]->h == h && g_pool[k]->depth == depth) {
+        if (g_pool[k]->w == w && g_pool[k]->h == h && g_pool[k]->depth == depth && g_pool[k]->sc == sc) {
             s = g_pool[k];
             g_pool.erase(g_pool.begin() + static_cast<std::ptrdiff_t>(k));
             break;
@@ -502,12 +543,12 @@ Surf *get_surf(u32 w, u32 h, bool depth) {
     if (!s) {
         g_surfs.push_back(std::make_unique<Surf>());
         s = g_surfs.back().get();
-        s->w = w, s->h = h, s->depth = depth;
+        s->w = w, s->h = h, s->depth = depth, s->sc = sc;
         WGPUTextureDescriptor d = WGPU_TEXTURE_DESCRIPTOR_INIT;
-        d.size = {card(w), card(h), 1};
+        d.size = {card_x(w, sc), card_y(h, sc), 1};
         d.format = depth ? WGPUTextureFormat_Depth32Float : WGPUTextureFormat_RGBA8Unorm;
         d.usage = depth ? (WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding)
-                        : (WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst | WGPUTextureUsage_StorageBinding);
+                        : (WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst);
         d.mipLevelCount = 1;
         d.sampleCount = 1;
         s->tex = wgpuDeviceCreateTexture(C.device, &d);
@@ -517,13 +558,36 @@ Surf *get_surf(u32 w, u32 h, bool depth) {
         } else {
             s->sample_group = tex_group(s->view, 0);
             s->sync_group = sync_group(g_store_layout, s->view);
-            s->load_group = sync_group(g_load_layout, s->view);
         }
         ++F.surfaces_made;
     }
     s->retired = false;
     s->id = ++g_res;
     return s;
+}
+
+// Loads (memory -> a new target) are written by a compute program into a staging texture of the surface's size and then copied into the
+// surface: the surfaces themselves have no storage usage (tile GPUs such as Mali do not compress a texture that has it).
+struct Staging {
+    WGPUTexture tex = nullptr;
+    WGPUTextureView view = nullptr;
+    WGPUBindGroup group = nullptr;
+};
+std::unordered_map<u64, Staging> g_staging;
+Staging &staging(u32 w, u32 h, const Sc &sc) {
+    Staging &st = g_staging[mix(mix((static_cast<u64>(w) << 32) | h, fbits(sc.x)), fbits(sc.y))];
+    if (!st.tex) {
+        WGPUTextureDescriptor d = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        d.size = {card_x(w, sc), card_y(h, sc), 1};
+        d.format = WGPUTextureFormat_RGBA8Unorm;
+        d.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_CopySrc;
+        d.mipLevelCount = 1;
+        d.sampleCount = 1;
+        st.tex = wgpuDeviceCreateTexture(C.device, &d);
+        st.view = wgpuTextureCreateView(st.tex, nullptr);
+        st.group = sync_group(g_load_layout, st.view);
+    }
+    return st;
 }
 
 // the surface's picture is not needed after this submit's uses: back to the pool after the submit
@@ -551,11 +615,37 @@ void release_target(int i) {
     ++g_epoch;
 }
 
+// a target drawn below the rows it was made with becomes `h` rows tall: a new surface, the colour picture copied into its top (depth is not
+// kept: a depth format is copied only whole, and the games clear it per frame)
+void grow(int ti, u32 h) {
+    Target &t = *g_targets[static_cast<std::size_t>(ti)];
+    if (t.h >= h) return;
+    Surf *old = t.s;
+    const u32 oh = t.h;
+    t.h = h;
+    drop_snap(t);
+    t.s = get_surf(t.w, t.h, t.depth, t.sc);
+    if (!t.depth) {
+        Op &op = add_op(kOpSelfCopy);
+        op.tex = old->tex;
+        op.tex2 = t.s->tex;
+        op.w = t.w;
+        op.h = oh;
+        op.sc = t.sc;
+        op.rd = old->id;
+        op.wr = t.s->id;
+        op.tgt = ti;
+    }
+    retire(old);
+    ++F.grown;
+    ++g_epoch;
+}
+
 // a full overwrite of the target: its new picture goes into a new surface (the old one stays for the draws that still read it)
 void rename(Target &t) {
     retire(t.s);
     drop_snap(t);
-    t.s = get_surf(t.w, t.h, t.depth);
+    t.s = get_surf(t.w, t.h, t.depth, t.sc);
     ++F.renames;
     ++g_epoch;  // the setups that read this target take the new surface
 }
@@ -599,15 +689,18 @@ int new_slot() {
     return static_cast<int>(g_targets.size() - 1);
 }
 
-int find_target(u32 bp, u32 bw, u32 psm, bool depth, u32 w, u32 h) {
+// `sc`: the scale of a new target (a colour target found keeps its own; a depth target is found only at its colour target's scale, so the
+// render pass's attachments are the same size)
+int find_target(u32 bp, u32 bw, u32 psm, bool depth, u32 w, u32 h, const Sc &sc) {
     for (std::size_t i = 0; i < g_targets.size(); ++i) {
         const Target *t = g_targets[i].get();
-        if (t && t->alive && t->depth == depth && t->bp == bp && t->bw == bw && t->psm == psm && (!depth || (t->w == w && t->h == h))) return static_cast<int>(i);
+        if (t && t->alive && t->depth == depth && t->bp == bp && t->bw == bw && t->psm == psm && (!depth || (t->w == w && t->h == h && t->sc == sc))) return static_cast<int>(i);
     }
     const int slot = new_slot();
     auto t = std::make_unique<Target>();
-    t->bp = bp, t->bw = bw, t->psm = psm, t->last_psm = psm, t->depth = depth, t->w = w, t->h = h;
-    t->s = get_surf(w, h, depth);
+    t->bp = bp, t->bw = bw, t->psm = psm, t->last_psm = psm, t->depth = depth, t->w = w, t->h = h, t->sc = sc;
+    t->s = get_surf(w, h, depth, sc);
+    if (g_log) std::fprintf(stderr, "[hwr] new %s target %04x/%u %ux%u at %.3fx, %.3fx\n", depth ? "depth" : "colour", bp, bw, w, h, sc.x, sc.y);
     g_targets[static_cast<std::size_t>(slot)] = std::move(t);
     ++F.targets_made;
     ++g_epoch;
@@ -615,9 +708,13 @@ int find_target(u32 bp, u32 bw, u32 psm, bool depth, u32 w, u32 h) {
     if (!depth && !g_page_stale[(bp / 32) & (kPages - 1)]) {
         Target &tt = *g_targets[static_cast<std::size_t>(slot)];
         Op &op = add_op(kOpLoad);
-        const u32 words[9] = {bp, bw, psm == 0x00 ? tt.last_psm : psm, 0, 0, w, h, 0, g_f_bits};
-        op.param = C.params(words, 9);
-        op.group = tt.s->load_group;
+        const u32 words[10] = {bp, bw, psm == 0x00 ? tt.last_psm : psm, 0, 0, w, h, 0, fbits(sc.x), fbits(sc.y)};
+        op.param = C.params(words, 10);
+        Staging &st = staging(w, h, sc);
+        op.sc = sc;
+        op.group = st.group;
+        op.tex = st.tex;
+        op.tex2 = tt.s->tex;
         op.w = w, op.h = h;
         op.wr = tt.s->id;
         op.tgt = slot;
@@ -637,7 +734,30 @@ u32 alloc_decoded(u32 words) {
     return static_cast<u32>(at);
 }
 
+void drop_entry(TexEntry &e) {
+    g_release_tex.push_back(e.tex);
+    g_release_view.push_back(e.view);
+    for (WGPUBindGroup g : e.groups)
+        if (g) g_release_group.push_back(g);
+}
+
+// an entry out of the cache: kept for a new texture of its size, or released
+void recycle(std::unordered_map<u64, std::unique_ptr<TexEntry>>::iterator it) {
+    std::unique_ptr<TexEntry> e = std::move(it->second);
+    g_cache_bytes -= e->bytes;
+    g_cache.erase(it);
+    auto &free = g_tex_free[e->dims];
+    if (free.size() < kFreePerSize) free.push_back(std::move(e));
+    else drop_entry(*e);
+}
+
 void cache_evict() {
+    // entries not used for a second (a movie's pictures): recycled
+    for (auto it = g_cache.begin(); it != g_cache.end();) {
+        auto next = std::next(it);
+        if (it->second->last_frame + kRecycleFrames < g_frames) recycle(it);
+        it = next;
+    }
     if (g_cache_bytes <= g_cache_budget) return;
     std::vector<std::pair<u64, u64>> order;  // (last frame, key)
     for (auto &[k, e] : g_cache)
@@ -645,14 +765,7 @@ void cache_evict() {
     std::sort(order.begin(), order.end());
     for (auto &[f, k] : order) {
         if (g_cache_bytes <= g_cache_budget * 3 / 4) break;
-        auto it = g_cache.find(k);
-        TexEntry &e = *it->second;
-        g_release_tex.push_back(e.tex);
-        g_release_view.push_back(e.view);
-        for (WGPUBindGroup g : e.groups)
-            if (g) g_release_group.push_back(g);
-        g_cache_bytes -= e.bytes;
-        g_cache.erase(it);
+        recycle(g_cache.find(k));
     }
 }
 
@@ -732,18 +845,28 @@ TexEntry *decode_texture(u64 key, const u32 *w, const u32 *mip, u32 top) {
     const u32 tw = w[15] & 0xFFu, th = w[15] >> 8;
     u32 levels = top + 1;
     levels = std::min(levels, std::max(tw, th) + 1);
-    auto e = std::make_unique<TexEntry>();
+    const u64 dims = (static_cast<u64>(tw) << 16) | (static_cast<u64>(th) << 8) | levels;
+    std::unique_ptr<TexEntry> e;
+    if (auto f = g_tex_free.find(dims); f != g_tex_free.end() && !f->second.empty()) {  // a recycled one: its texture, view and groups stay
+        e = std::move(f->second.back());
+        f->second.pop_back();
+        e->last_frame = 0;
+        ++F.recycled;
+    } else {
+        e = std::make_unique<TexEntry>();
+        WGPUTextureDescriptor d = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        d.size = {1u << tw, 1u << th, 1};
+        d.format = WGPUTextureFormat_RGBA8Unorm;
+        d.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+        d.mipLevelCount = levels;
+        d.sampleCount = 1;
+        e->tex = wgpuDeviceCreateTexture(C.device, &d);
+        e->view = wgpuTextureCreateView(e->tex, nullptr);
+    }
     e->key = key;
     e->levels = levels;
+    e->dims = dims;
     e->id = ++g_res;
-    WGPUTextureDescriptor d = WGPU_TEXTURE_DESCRIPTOR_INIT;
-    d.size = {1u << tw, 1u << th, 1};
-    d.format = WGPUTextureFormat_RGBA8Unorm;
-    d.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-    d.mipLevelCount = levels;
-    d.sampleCount = 1;
-    e->tex = wgpuDeviceCreateTexture(C.device, &d);
-    e->view = wgpuTextureCreateView(e->tex, nullptr);
     u32 bytes = 0;
     for (u32 n = 0; n < levels; ++n) {
         u32 s[40];
@@ -992,14 +1115,37 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     }
     s.blend = std::min<float>(static_cast<float>(w[9]) / 128.0f, 1.0f);
     // targets
-    const u32 W = std::max<u32>(64, fbw * 64), H = 512;
+    // A new colour target is as tall as the scissor of its first draw (rounded up to 32 rows; 512 with PS2_HWR_FULL_HEIGHT=1): the display
+    // buffer of a field game holds 256 rows, its frame 384, and every card texel of a render pass is loaded and stored by a tile GPU
+    // whether it is drawn or not. A later draw below it makes it 512 rows (grow()).
+    static const bool full_height = os::env("PS2_HWR_FULL_HEIGHT") == "1";
+    const u32 used = std::clamp<u32>((w[11] >> 16) + 1u, 64u, 512u);
+    const u32 W = std::max<u32>(64, fbw * 64), H = full_height ? 512u : std::min<u32>(512u, (used + 31u) & ~31u);
     const u32 cclass = is16(fpsm) ? fpsm : 0x00;
-    s.color = find_target(fbp, fbw, cclass, false, W, H);
+    Sc csc = base_scale(W);
+    if (g_rows > 0.0f && W >= kSmallWidth) csc.y = std::min(csc.y, g_rows / static_cast<float>(used));
+    s.color = find_target(fbp, fbw, cclass, false, W, H, csc);
     g_targets[static_cast<std::size_t>(s.color)]->last_psm = fpsm;
     s.zmax = w[23];
     s.zscale = static_cast<double>(s.zmax) + 1.0;
     s.needs_depth = zte && (ztst != 1 || pass_z || fail_z);
-    if (s.needs_depth) s.depth = find_target(zbp, fbw, zpsm, true, W, H);
+    if (s.needs_depth) {
+        // A depth buffer drawn with colour targets of two scales (the frame and the display copy share Z 1400 here): a draw that only writes
+        // depth (no test) into one held at another scale drops its depth writes, instead of making a second buffer that would evict the
+        // first one every frame. A draw that tests depth gets its own buffer at its scale.
+        const Target &ctg = *g_targets[static_cast<std::size_t>(s.color)];
+        const Sc &csc2 = ctg.sc;
+        const u32 CH = ctg.h;
+        bool other = false;
+        for (const auto &t : g_targets)
+            if (t && t->alive && t->depth && t->bp == zbp && t->bw == fbw && t->psm == zpsm && t->w == W && !(t->sc == csc2 && t->h == CH)) other = true;
+        if (other && ztst == 1) {
+            s.needs_depth = false;
+            ++F.approx[kDepthScale];
+        } else {
+            s.depth = find_target(zbp, fbw, zpsm, true, W, CH, csc2);
+        }
+    }
     s.cwrite_any = (pass_mask | fail_mask) != 0;
     s.zwrite_any = pass_z || fail_z;
     s.color_full = pass_mask == (fpsm == 0x01 ? 7u : 15u) && split == 0;
@@ -1035,7 +1181,10 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     p[8] = mip[0];
     p[9] = s.src.levels ? s.src.levels - 1 : 0;
     p[10] = w[9];  // FIX
-    p[11] = s.src.kind == 2 && s.src.target >= 0 && g_f != 1.0f ? g_f_bits : 0u;  // a target source: its card texels per GS texel (f32 bits; 0 = 1)
+    const Sc src_sc = s.src.kind == 2 && s.src.target >= 0 ? g_targets[static_cast<std::size_t>(s.src.target)]->sc : Sc{};
+    const bool scaled = src_sc.x != 1.0f || src_sc.y != 1.0f;
+    p[11] = scaled ? fbits(src_sc.x) : 0u;  // a target source: its card texels per GS texel across and down (f32 bits; 0 = not scaled)
+    p[12] = scaled ? fbits(src_sc.y) : 0u;
     // pipelines
     const u32 tk = s.src.kind == 1 ? 1u : s.src.kind == 2 ? 2u : 0u;
     PipeKey k = base;
@@ -1050,6 +1199,7 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     s.k2.mask = fail_mask;
     s.k2.zwrite = fail_z;
     s.k2.atest = 2;
+    if (!s.needs_depth) s.k1.zwrite = s.k2.zwrite = false;  // its depth writes dropped (a depth buffer held at another scale)
     if (split != 2) s.k2 = PipeKey{}, s.k2.mask = 0xFFu;  // marks "no second draw"
     if (!pass_mask && !pass_z) s.k1.mask = 0xFEu;          // the first draw writes nothing: only the second one is drawn
     s.kp1 = s.k1.mask == 0xFEu ? 0 : s.k1.pack() | kKeyOn;
@@ -1103,7 +1253,7 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res) {
             }
     if (!fresh) {
         drop_snap(t);
-        t.snap = get_surf(t.w, t.h, false);
+        t.snap = get_surf(t.w, t.h, false, t.sc);
         t.snap_of = t.s;
         const u32 w = static_cast<u32>(std::clamp<int>(t.valid_w, 1, static_cast<int>(t.w))), h = static_cast<u32>(std::clamp<int>(t.valid_h, 1, static_cast<int>(t.h)));
         Op &op = add_op(kOpSelfCopy);
@@ -1111,11 +1261,12 @@ WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res) {
         op.tex2 = t.snap->tex;
         op.w = w;
         op.h = h;
+        op.sc = t.sc;
         op.rd = t.s->id;
         op.wr = t.snap->id;
         op.tgt = ti;
         ++F.self_copies;
-        F.copy_bytes += static_cast<u64>(card(w)) * card(h) * 4;
+        F.copy_bytes += static_cast<u64>(card_x(w, t.sc)) * card_y(h, t.sc) * 4;
     }
     res = t.snap->id;
     return t.snap->sample_group;
@@ -1223,9 +1374,15 @@ void timer_init();
 bool init(const Context &ctx) {
     C = ctx;
     g_s = std::max<u32>(ctx.scale, 1u);
-    g_f = ctx.target_scale > 0.0f ? std::clamp(ctx.target_scale, 0.25f, 6.0f) : static_cast<float>(g_s);
-    std::memcpy(&g_f_bits, &g_f, 4);
-    std::fprintf(stderr, "[hwr] targets at %.3fx (card texels per GS pixel), graphics memory at %ux\n", g_f, g_s);
+    g_fx = ctx.target_scale > 0.0f ? std::clamp(ctx.target_scale, 0.25f, 6.0f) : static_cast<float>(g_s);
+    const float fy = static_cast<float>(std::atof(os::env("PS2_HWR_SCALE_Y").c_str()));
+    g_fy = fy > 0.0f ? std::clamp(fy, 0.25f, 6.0f) : g_fx;
+    const std::string small = os::env("PS2_HWR_SMALL_SCALE");
+    const float cap = small.empty() ? 2.0f : static_cast<float>(std::atof(small.c_str()));
+    g_small = cap > 0.0f && g_fx > cap ? cap / g_fx : 1.0f;
+    g_rows = std::max(0.0f, static_cast<float>(std::atof(os::env("PS2_HWR_ROWS").c_str())));
+    std::fprintf(stderr, "[hwr] targets at %.3fx across, %.3fx down (card texels per GS pixel), narrower than %u at %.3fx, %.3fx; graphics memory at %ux\n", g_fx, g_fy,
+                 kSmallWidth, g_fx * g_small, g_fy * g_small, g_s);
     g_log = os::env("PS2_HWR_LOG") == "1";
     g_stream_order = os::env("PS2_HWR_ORDER") == "stream";
     if (const std::string mb = os::env("PS2_HWR_CACHE_MB"); !mb.empty()) g_cache_budget = std::strtoull(mb.c_str(), nullptr, 10) << 20;
@@ -1260,20 +1417,23 @@ bool init(const Context &ctx) {
     {
         WGPUBindGroupLayoutEntry e = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
         e.binding = 0;
-        e.visibility = WGPUShaderStage_Fragment;
+        e.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
         e.buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
         g_params_layout = make_layout(&e, 1);
     }
     {
-        WGPUBindGroupLayoutEntry e[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+        WGPUBindGroupLayoutEntry e[4] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+                                         WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
         e[0].binding = 0;
         e[0].visibility = WGPUShaderStage_Fragment;
         e[0].texture.sampleType = WGPUTextureSampleType_Float;
         e[0].texture.viewDimension = WGPUTextureViewDimension_2D;
-        e[1].binding = 1;
-        e[1].visibility = WGPUShaderStage_Fragment;
-        e[1].sampler.type = WGPUSamplerBindingType_Filtering;
-        g_tex_layout = make_layout(e, 2);
+        for (u32 k = 1; k < 4; ++k) {
+            e[k].binding = k;
+            e[k].visibility = WGPUShaderStage_Fragment;
+            e[k].sampler.type = WGPUSamplerBindingType_Filtering;
+        }
+        g_tex_layout = make_layout(e, 4);
     }
     {
         WGPUBindGroupLayoutEntry e = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
@@ -1400,7 +1560,8 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     const ps2::gs::Context &gc = st.ctx[(attr >> 9) & 1u];
     const float ofx = static_cast<float>(gc.xyoffset & 0xFFFFu), ofy = static_cast<float>((gc.xyoffset >> 32) & 0xFFFFu);
     Target &ct = *g_targets[static_cast<std::size_t>(s.color)];
-    const int W = static_cast<int>(ct.w), H = static_cast<int>(ct.h);
+    const int W = static_cast<int>(ct.w);
+    int H = static_cast<int>(ct.h);
     float px[3], py[3];
     float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
     for (int i = 0; i < n; ++i) {
@@ -1416,6 +1577,11 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     if (x1 < x0 || y1 < y0) {
         ++F.skipped;
         return;
+    }
+    if (y1 >= H && H < 512) {  // below the rows the target was made with: it (and its depth) become 512 rows
+        grow(s.color, 512);
+        if (s.needs_depth) grow(s.depth, 512);
+        H = static_cast<int>(ct.h);
     }
     if (x1 >= W || y1 >= H) {
         ++F.approx[kOutside];
@@ -1673,8 +1839,8 @@ void before_display(u32 fbp, u32 fbw, u32 psm, u32 x, u32 y, u32 w, u32 h) {
     const u32 x1 = std::min(x + w, t.w), y1 = std::min(y + h, t.h);
     if (x1 <= x || y1 <= y) return;
     Op &op = add_op(kOpStore);
-    const u32 words[9] = {t.bp, t.bw, t.last_psm, x, y, x1 - x, y1 - y, 0, g_f_bits};
-    op.param = C.params(words, 9);
+    const u32 words[10] = {t.bp, t.bw, t.last_psm, x, y, x1 - x, y1 - y, 0, fbits(t.sc.x), fbits(t.sc.y)};
+    op.param = C.params(words, 10);
     op.group = t.s->sync_group;
     op.rd = t.s->id;
     op.tgt = owner;
@@ -1685,6 +1851,48 @@ void before_display(u32 fbp, u32 fbw, u32 psm, u32 x, u32 y, u32 w, u32 h) {
         touch_page(page);
     });
     ++F.stores;
+}
+
+namespace {
+struct ShowPending {
+    bool on = false;
+    int owner = -1;
+    u32 x = 0, y = 0, w = 0, h = 0;  // card texels
+} g_show;
+const bool g_present_memory = os::env("PS2_HWR_PRESENT") == "memory";
+}  // namespace
+
+bool display_target(u32 fbp, u32 fbw, u32 psm, u32 x, u32 y, u32 w, u32 h, u32 &card_w, u32 &card_h) {
+    g_show.on = false;
+    if (!g_on || g_present_memory || !w || !h) return false;
+    u32 f[5];
+    C.fmt_words(psm, fbp, fbw, f);
+    const int owner = g_owner[(block_at(f, x, y) / 32) & (kPages - 1)];
+    if (owner < 0) return false;
+    const Target &t = *g_targets[static_cast<std::size_t>(owner)];
+    if (!t.alive || t.depth || t.bp != fbp || t.bw != fbw || !t.s) return false;
+    const u32 tw = card_x(t.w, t.sc), th = card_y(t.h, t.sc);
+    const u32 x0 = card_at_x(x, t.sc), y0 = card_at_y(y, t.sc);
+    const u32 x1 = std::min(card_at_x(std::min(x + w, t.w), t.sc), tw), y1 = std::min(card_at_y(std::min(y + h, t.h), t.sc), th);
+    if (x1 <= x0 || y1 <= y0) return false;
+    g_show = {true, owner, x0, y0, x1 - x0, y1 - y0};
+    card_w = x1 - x0;
+    card_h = y1 - y0;
+    return true;
+}
+
+void show(WGPUTexture dst) {
+    if (!g_show.on) return;
+    g_show.on = false;
+    const Target &t = *g_targets[static_cast<std::size_t>(g_show.owner)];
+    Op &op = add_op(kOpShow);
+    op.tex = t.s->tex;
+    op.tex2 = dst;
+    op.offset = g_show.x, op.pitch = g_show.y;
+    op.w = g_show.w, op.h = g_show.h;
+    op.rd = t.s->id;
+    op.tgt = g_show.owner;
+    close_pass();
 }
 
 void sync_all() {
@@ -1698,8 +1906,8 @@ void sync_all() {
         const float scale = static_cast<float>(static_cast<double>(t->depth ? (t->psm == 0x30 ? 0xFFFFFFFFu : t->psm == 0x31 ? 0xFFFFFFu : 0xFFFFu) : 0u) + 1.0);
         u32 sbits;
         std::memcpy(&sbits, &scale, 4);
-        const u32 words[9] = {t->bp, t->bw, t->depth ? t->psm : t->last_psm, 0, 0, w, h, sbits, g_f_bits};
-        op.param = C.params(words, 9);
+        const u32 words[10] = {t->bp, t->bw, t->depth ? t->psm : t->last_psm, 0, 0, w, h, sbits, fbits(t->sc.x), fbits(t->sc.y)};
+        op.param = C.params(words, 10);
         op.group = t->s->sync_group;
         op.rd = t->s->id;
         op.tgt = static_cast<int>(i);
@@ -1932,9 +2140,21 @@ void schedule() {
         }
         Graph g;
         build_graph(g);
+        // a load whose surface nothing draws into, reads or copies afterwards and that no target holds any more is not done: a target
+        // made over current memory and cleared (renamed) right after (the menus: ~50 MB a frame at the screen's resolution)
+        std::vector<u8> dead(n, 0);
+        for (std::size_t i = 0; i < n; ++i) {
+            const Op &op = g_ops[i];
+            if (op.kind != kOpLoad || !g.succ[i].empty()) continue;
+            for (const auto &sf : g_surfs)
+                if (sf->id == op.wr) {
+                    if (sf->retired) dead[i] = 1, ++F.approx[kDeadLoad];
+                    break;
+                }
+        }
         std::vector<int> anchor_index(n, -1), anchors;
         for (std::size_t i = 0; i < n; ++i)
-            if (anchored(g_ops[i])) anchor_index[i] = static_cast<int>(anchors.size()), anchors.push_back(static_cast<int>(i));
+            if (anchored(g_ops[i]) && !dead[i]) anchor_index[i] = static_cast<int>(anchors.size()), anchors.push_back(static_cast<int>(i));
         const int end = static_cast<int>(anchors.size());
         std::vector<int> dl(n, end);
         for (std::size_t r = n; r-- > 0;) {
@@ -1946,7 +2166,7 @@ void schedule() {
         }
         std::vector<std::vector<int>> groups(static_cast<std::size_t>(end) + 1);
         for (std::size_t i = 0; i < n; ++i)
-            if (anchor_index[i] < 0) groups[static_cast<std::size_t>(dl[i])].push_back(static_cast<int>(i));
+            if (anchor_index[i] < 0 && !dead[i]) groups[static_cast<std::size_t>(dl[i])].push_back(static_cast<int>(i));
         for (int k = 0; k <= end; ++k) {
             const u32 pos = k < end ? g_ops[static_cast<std::size_t>(anchors[static_cast<std::size_t>(k)])].pos : ~0u;
             const std::size_t from = seq.size();
@@ -2033,7 +2253,7 @@ void schedule() {
     F.nodes += n;
     F.sched_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (g_dump_now) {
-        const char *kn[] = {"pass", "copylevel", "load", "store", "storez", "selfcopy"};
+        const char *kn[] = {"pass", "copylevel", "load", "store", "storez", "selfcopy", "show"};
         std::fprintf(stderr, "[hwr-dump] submit %llu: %zu ops -> %zu items\n", static_cast<unsigned long long>(g_submit), n, g_items.size());
         for (const Item &it : g_items) {
             if (it.op >= 0) {
@@ -2160,8 +2380,8 @@ WGPURenderPipeline draw_pipeline(u64 key, bool zuse, bool pass_depth) {
 void encode_pass(WGPUCommandEncoder enc, const Item &it) {
     if (!it.draw_n && !it.clear_c && !it.clear_d) return;
     static const bool no_pass = os::env("PS2_HWR_NOPASS") == "1";  // measuring aid: render passes are not encoded (the picture is wrong)
-    if (no_pass) return;
-    const u64 cbytes = static_cast<u64>(card(it.cs->w)) * card(it.cs->h) * 4;
+    if (no_pass || g_sweep == 2) return;
+    const u64 cbytes = static_cast<u64>(card_x(it.cs->w, it.cs->sc)) * card_y(it.cs->h, it.cs->sc) * 4;
     WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
     ca.view = it.cs->view;
     ca.loadOp = it.clear_c ? WGPULoadOp_Clear : WGPULoadOp_Load;
@@ -2181,7 +2401,7 @@ void encode_pass(WGPUCommandEncoder enc, const Item &it) {
         da.depthStoreOp = it.store_d ? WGPUStoreOp_Store : WGPUStoreOp_Discard;
         da.depthClearValue = it.clear_d ? it.cz : 0.0f;
         rd.depthStencilAttachment = &da;
-        const u64 dbytes = static_cast<u64>(card(it.ds->w)) * card(it.ds->h) * 4;
+        const u64 dbytes = static_cast<u64>(card_x(it.ds->w, it.ds->sc)) * card_y(it.ds->h, it.ds->sc) * 4;
         if (load) ++F.att_loads, F.att_load_bytes += dbytes;
         if (it.store_d) ++F.att_stores, F.att_store_bytes += dbytes;
     }
@@ -2197,7 +2417,7 @@ void encode_pass(WGPUCommandEncoder enc, const Item &it) {
     WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
     ++F.passes;
     static const bool no_draw = os::env("PS2_HWR_NOPASS") == "draws";  // measuring aid: render passes without their draws
-    if (it.draw_n && !no_draw) {
+    if (it.draw_n && !no_draw && g_sweep != 1) {
         wgpuRenderPassEncoderSetVertexBuffer(rp, 0, g_vbuf, 0, g_vorder.size() * sizeof(Vtx));
         wgpuRenderPassEncoderSetBindGroup(rp, 0, g_param_group, 0, nullptr);
         WGPURenderPipeline cur = nullptr;
@@ -2214,7 +2434,9 @@ void encode_pass(WGPUCommandEncoder enc, const Item &it) {
                 ++F.groups;
             }
             if (!std::equal(r.sc, r.sc + 4, cur_sc)) {
-                wgpuRenderPassEncoderSetScissorRect(rp, card_at(r.sc[0]), card_at(r.sc[1]), card_at(r.sc[0] + r.sc[2]) - card_at(r.sc[0]), card_at(r.sc[1] + r.sc[3]) - card_at(r.sc[1]));
+                const Sc &tw = it.cs->sc;
+                wgpuRenderPassEncoderSetScissorRect(rp, card_at_x(r.sc[0], tw), card_at_y(r.sc[1], tw), card_at_x(r.sc[0] + r.sc[2], tw) - card_at_x(r.sc[0], tw),
+                                                    card_at_y(r.sc[1] + r.sc[3], tw) - card_at_y(r.sc[1], tw));
                 std::copy(r.sc, r.sc + 4, cur_sc);
             }
             if (r.blend != cur_blend) {
@@ -2261,7 +2483,7 @@ void encode_op(WGPUCommandEncoder enc, const Op &op) {
         src.texture = op.tex;
         WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
         dst.texture = op.tex2;
-        const WGPUExtent3D size{card(op.w), card(op.h), 1};
+        const WGPUExtent3D size{card_x(op.w, op.sc), card_y(op.h, op.sc), 1};
         wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &size);
         return;
     }
@@ -2272,10 +2494,28 @@ void encode_op(WGPUCommandEncoder enc, const Op &op) {
         wgpuComputePassEncoderSetBindGroup(cp, 0, *C.group, 1, &offset);
         wgpuComputePassEncoderSetBindGroup(cp, 1, op.group, 0, nullptr);
         // stores: one thread per memory sample; loads: one per target texel (the rectangle's texels, +1 for the rounding at its edges)
-        const u32 tw = op.kind == kOpLoad ? card(op.w) + 1 : op.w * g_s, th = op.kind == kOpLoad ? card(op.h) + 1 : op.h * g_s;
+        const u32 tw = op.kind == kOpLoad ? card_x(op.w, op.sc) + 1 : op.w * g_s, th = op.kind == kOpLoad ? card_y(op.h, op.sc) + 1 : op.h * g_s;
         wgpuComputePassEncoderDispatchWorkgroups(cp, (tw + 7) / 8, (th + 7) / 8, 1);
         wgpuComputePassEncoderEnd(cp);
         wgpuComputePassEncoderRelease(cp);
+        if (op.kind == kOpLoad) {  // the whole staging picture (every texel of it is inside the target) into the surface
+            WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            src.texture = op.tex;
+            WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            dst.texture = op.tex2;
+            const WGPUExtent3D size{card_x(op.w, op.sc), card_y(op.h, op.sc), 1};
+            wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &size);
+        }
+        return;
+    }
+    case kOpShow: {  // the displayed rectangle of a target (card texels at offset, pitch) into gpu.cpp's field texture at 0, 0
+        WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+        src.texture = op.tex;
+        src.origin = {op.offset, op.pitch, 0};
+        WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+        dst.texture = op.tex2;
+        const WGPUExtent3D size{op.w, op.h, 1};
+        wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &size);
         return;
     }
     }
@@ -2388,6 +2628,7 @@ void stats() {
 // the browser build has no hardware renderer: PS2_RENDERER is ignored there
 namespace ps2::gs::gpu::hwr {
 bool g_on = false;
+int g_sweep = 0;
 bool requested() { return false; }
 bool init(const Context &) { return false; }
 void shape(const State &, const std::uint32_t *, const std::uint32_t *, std::uint32_t, std::uint64_t, const Vertex *, int) {}

@@ -11,6 +11,7 @@ USAGE = '''usage: pnach.py crc <elf>
        pnach.py apply <elf> <patched elf> <runtime list> [--section NAME]... [--crc HEX] <pnach>...
        pnach.py fetch <disc image or elf> [--out DIR] [--json]   download the game's patch file from PCSX2's repository
        pnach.py sections <pnach> [<disc image or elf>] [--json]  list the sections of a patch file
+       pnach.py knobs <elf> <pnach> [--section NAME]   a widescreen section as aspect knobs (eerecomp --aspect-knobs)
 (--json prints one line of JSON instead of the text, for the Windows app.)'''
 # PS2_PNACH_REPO points the download at another folder of patch files (a mirror, or a local web server in a test); it
 # is the web address of the folder, with the slash at the end.
@@ -622,7 +623,68 @@ def resolve(patches, guarded, notes):
     return result, toggles
 
 
+def knobs_command(args):
+    """A widescreen section whose patches all replace a `lui` constant (the upper half of a float: zoom, field of view, HUD
+    scale) as aspect knobs: ADDRESS POWER lines for eerecomp --aspect-knobs. The power says how the constant follows the screen's
+    widening r (screen aspect / (4:3)): the patch's new value over the old one is r16 = (16:9) / (4:3) to that power. The code
+    then loads the constant scaled for the screen it runs on (PS2_ASPECT), and the unchanged constant without it. Exit 1 (and
+    nothing printed) when the section has another kind of patch: then it is applied to the program as before."""
+    import math
+    if len(args) < 2:
+        sys.exit(USAGE)
+    elf, path, wanted = open(args[0], 'rb').read(), args[1], set()
+    rest = args[2:]
+    while rest:
+        if rest[0] == '--section' and len(rest) > 1:
+            wanted.add(rest[1])
+            rest = rest[2:]
+        else:
+            sys.exit(USAGE)
+    sections, skipped = {}, []
+    if not wanted:
+        parse(path, set(), sections, skipped)
+        wanted = {name for name, info in sections.items() if is_wide(name, info)}
+        sections = {}
+    if not wanted:
+        sys.exit(1)
+    patches = parse(path, wanted, sections, skipped)
+    aspects = {info['aspect'] for name, info in sections.items() if name in wanted and info['aspect']}
+    target = 16 / 9
+    for a in aspects:
+        m = re.match(r'\s*(\d+(?:\.\d+)?)\s*[:/x]\s*(\d+(?:\.\d+)?)', a)
+        if m:
+            target = float(m.group(1)) / float(m.group(2))
+    r = target / (4 / 3)
+    if not patches or skipped or abs(r - 1) < 0.01:
+        sys.exit(1)
+
+    def word_at(address):
+        for base, offset, filesz, _ in segments(elf):
+            if base <= address < base + filesz - 3:
+                return struct.unpack_from('<I', elf, offset + address - base)[0]
+        return None
+
+    lines = []
+    for place, address, size, value in patches:
+        address = physical(address)
+        old = word_at(address)
+        if size != 4 or old is None or old >> 26 != 0x0F or value >> 26 != 0x0F or (old >> 16) & 0x1F != (value >> 16) & 0x1F:
+            sys.exit(1)
+        a = struct.unpack('<f', struct.pack('<I', (old & 0xFFFF) << 16))[0]
+        b = struct.unpack('<f', struct.pack('<I', (value & 0xFFFF) << 16))[0]
+        if not a or not b or (a < 0) != (b < 0):
+            sys.exit(1)
+        power = round(math.log(b / a) / math.log(r))
+        # the patch keeps 16 bits of the float: a few tenths of a percent from the exact r ** power
+        if power == 0 or abs(b / a / r ** power - 1) > 0.02:
+            sys.exit(1)
+        lines.append('%08x %d  # %g -> %g at %s' % (address, power, a, b, ' / '.join(sorted(aspects)) or '16:9'))
+    print('\n'.join(lines))
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'knobs':
+        return knobs_command(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] in ('fetch', 'sections'):
         return plain(fetch_command if sys.argv[1] == 'fetch' else sections_command, sys.argv[2:])
     if len(sys.argv) == 3 and sys.argv[1] == 'crc':

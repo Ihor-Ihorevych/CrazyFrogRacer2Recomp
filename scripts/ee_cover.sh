@@ -24,7 +24,8 @@ work=${EE_COVER_WORK:-$ROOT/../eecov}   # run.sh/drive.py work dir: st/ (states)
 case "${1:-}" in
   translate)
     [ -d "$gen" ] || { mkdir -p "$gen"; cp -r generated/cfr2_vu_all/. "$gen/"; }
-    build/tools/eerecomp.exe "$elf" --entries $game/entries_ee_all.txt --out "$gen" | tail -1 ;;
+    knobs=(); [ ! -f $game/aspect.txt ] || knobs=(--aspect-knobs $game/aspect.txt)
+    build/tools/eerecomp.exe "$elf" --entries $game/entries_ee_all.txt "${knobs[@]}" --out "$gen" | tail -1 ;;
   build)
     if [ ! -f "$bld/build.ninja" ]; then
       cxx=$(grep '^CMAKE_CXX_COMPILER:STRING' build/native-vuall/CMakeCache.txt | cut -d= -f2)

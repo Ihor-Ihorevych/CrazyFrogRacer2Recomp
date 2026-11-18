@@ -772,6 +772,10 @@ private:
         case Xori: set_d(rt, std::format("{} ^ {}", d(rs), uimm(i))); break;
         case Lui:
             if (!rt) break;
+            if (const auto k = options_.aspect_knobs.find(i.pc); k != options_.aspect_knobs.end()) {
+                line(std::format("c.r[{}].sd[0] = static_cast<std::int32_t>(aspect_word({}, {}));", rt, hex(i.uimm() << 16), k->second));
+                break;
+            }
             if (const auto e = field(i)) line(std::format("c.r[{}].sd[0] = static_cast<std::int32_t>({} << 16);", rt, *e));
             else line(std::format("c.r[{}].sd[0] = static_cast<std::int32_t>({});", rt, hex(i.uimm() << 16)));
             break;

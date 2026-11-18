@@ -65,6 +65,19 @@ namespace ps2 {
 
 Cpu g_cpu;
 Options g_options;
+// PS2_ASPECT=<width>:<height> (or one number, the ratio): the screen shape the game's camera is widened to through its aspect knobs
+// (generated.hpp aspect_word; games/<name>/aspect.txt). The widening is that shape over 4:3, 1 to 3; unset: 1 (the game's own picture).
+float g_aspect_widen = [] {
+    const char *v = std::getenv("PS2_ASPECT");
+    if (!v || !*v) return 1.0f;
+    double ratio = std::atof(v);
+    if (const char *colon = std::strchr(v, ':')) {
+        const double h = std::atof(colon + 1);
+        ratio = h > 0 ? std::atof(v) / h : 0;
+    }
+    if (!(ratio > 0)) return 1.0f;
+    return static_cast<float>(std::clamp(ratio / (4.0 / 3.0), 1.0, 3.0));
+}();
 
 bool frame_capture_requested(std::uint64_t frame) {
     if (g_options.frame_every && frame % g_options.frame_every == 0) return true;

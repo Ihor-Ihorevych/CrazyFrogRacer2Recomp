@@ -16,8 +16,35 @@ struct Blit {
     uv_offset: vec2<f32>,
 }
 
-@group(0) @binding(0) var<storage, read> pixels: array<u32>;
+// The picture is prepared once per presented frame (prep_mem / prep_tex below: the field, or the blend of the two latest fields, in `scene`)
+// and the present pass reads it as a texture: through the texture cache, with the card's bilinear filter for the smooth reads. Before, every
+// screen pixel read the fields from a storage buffer (up to ~70 uncached reads for the sharp look with smoothed edges), which tile GPUs
+// such as Mali did slowly: ~2.7 M screen pixels a frame.
+@group(0) @binding(0) var<storage, read> pixels: array<u32>;                 // prep_mem: the display kernel's fields (gpu.cpp scratch)
 @group(0) @binding(1) var<uniform> blit: Blit;
+@group(0) @binding(2) var scene_in: texture_2d<f32>;                          // fs: the prepared picture (its top left width x height)
+@group(0) @binding(3) var scene_smooth: sampler;                              // fs: bilinear, clamp to edge
+@group(0) @binding(4) var scene_out: texture_storage_2d<rgba8unorm, write>;  // prep
+@group(0) @binding(5) var field_now: texture_2d<f32>;                         // prep_tex: the field shown now (a copy of the target)
+@group(0) @binding(6) var field_before: texture_2d<f32>;                      // prep_tex: the one before
+@group(0) @binding(7) var scene_before: texture_2d<f32>;                      // fs, blend 2: the field before, blended here (no prepare pass)
+
+@compute @workgroup_size(8, 8)
+fn prep_mem(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= blit.width || g.y >= blit.height) { return; }
+    let i = g.y * blit.width + g.x;
+    var c = unpack4x8unorm(pixels[blit.current + i]);
+    if (blit.blend != 0u) { c = (c + unpack4x8unorm(pixels[blit.previous + i])) * 0.5; }
+    textureStore(scene_out, vec2<i32>(g.xy), vec4<f32>(c.rgb, 1.0));
+}
+
+@compute @workgroup_size(8, 8)
+fn prep_tex(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= blit.width || g.y >= blit.height) { return; }
+    var c = textureLoad(field_now, vec2<i32>(g.xy), 0);
+    if (blit.blend != 0u) { c = (c + textureLoad(field_before, vec2<i32>(g.xy), 0)) * 0.5; }
+    textureStore(scene_out, vec2<i32>(g.xy), vec4<f32>(c.rgb, 1.0));
+}
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -33,16 +60,24 @@ fn vs(@builtin(vertex_index) i: u32) -> VertexOut {
     return o;
 }
 
-fn texel(base: u32, x: i32, y: i32) -> vec4<f32> {
-    let cx = u32(clamp(x, 0, i32(blit.width) - 1));
-    let cy = u32(clamp(y, 0, i32(blit.height) - 1));
-    return unpack4x8unorm(pixels[base + cy * blit.width + cx]);
+fn texel(x: i32, y: i32) -> vec3<f32> {
+    let cx = clamp(x, 0, i32(blit.width) - 1);
+    let cy = clamp(y, 0, i32(blit.height) - 1);
+    return textureLoad(scene_in, vec2<i32>(cx, cy), 0).rgb;
+}
+
+// the bilinear blend of the four pixels around p (in pixels from the first one's corner, as the reads it replaces: floor(p) and the next ones,
+// clamped to the picture): one filtered read
+fn bilerp(p: vec2<f32>) -> vec3<f32> {
+    let size = vec2<f32>(f32(blit.width), f32(blit.height));
+    let q = clamp(p, vec2<f32>(0.0), size - 1.0);
+    return textureSampleLevel(scene_in, scene_smooth, (q + 0.5) / vec2<f32>(textureDimensions(scene_in)), 0.0).rgb;
 }
 
 // Three ways to enlarge the picture to the window (bit 2 below). Sharp (the default of bit 1 = 0): every PS2 pixel stays a hard square and only
 // its border blends, the way an emulator shows it. Soft (bit 1): a plain smooth blend between neighbouring pixels everywhere,
 // which is closest to what a TV did to the picture. Sharp (bit 2): see sharp_scene.
-fn sample(base: u32, uv: vec2<f32>) -> vec4<f32> {
+fn sample(uv: vec2<f32>) -> vec3<f32> {
     let size = vec2<f32>(f32(blit.width), f32(blit.height));
     let t = uv * size;
     var p: vec2<f32>;
@@ -54,19 +89,11 @@ fn sample(base: u32, uv: vec2<f32>) -> vec4<f32> {
         let region = 0.5 - 0.5 / scale;
         p = floor(t) + (d - clamp(d, -region, region)) * scale;
     }
-    let origin = floor(p);
-    let f = p - origin;
-    let x = i32(origin.x);
-    let y = i32(origin.y);
-    let top = mix(texel(base, x, y), texel(base, x + 1, y), f.x);
-    let bottom = mix(texel(base, x, y + 1), texel(base, x + 1, y + 1), f.x);
-    return mix(top, bottom, f.y);
+    return bilerp(p);
 }
 
 fn scene(uv: vec2<f32>) -> vec3<f32> {
-    var c = sample(blit.current, uv).rgb;
-    if (blit.blend != 0u) { c = (c + sample(blit.previous, uv).rgb) * 0.5; }
-    return c;
+    return sample(uv);
 }
 
 // Catmull-Rom weights (the cubic that passes through every source pixel and has a little overshoot at edges) for the four source
@@ -146,9 +173,7 @@ fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
 
 // The colour of one source pixel (no blending between pixels): the cheap read the edge test uses.
 fn scene_texel(x: i32, y: i32) -> vec3<f32> {
-    var c = texel(blit.current, x, y).rgb;
-    if (blit.blend != 0u) { c = (c + texel(blit.previous, x, y).rgb) * 0.5; }
-    return c;
+    return texel(x, y);
 }
 
 fn edge_aa(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
@@ -188,13 +213,7 @@ fn edge_aa(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
 
 // A plain smooth blend of the four source pixels around p (in source pixels, from the corner of the first).
 fn smooth_at(p: vec2<f32>) -> vec3<f32> {
-    let origin = floor(p);
-    let f = p - origin;
-    let x = i32(origin.x);
-    let y = i32(origin.y);
-    let top = mix(scene_texel(x, y), scene_texel(x + 1, y), f.x);
-    let bottom = mix(scene_texel(x, y + 1), scene_texel(x + 1, y + 1), f.x);
-    return mix(top, bottom, f.y);
+    return bilerp(p);
 }
 
 // A picture bigger than the window (an upscaled one in a smaller window): the looks above enlarge, and reading a few source pixels
@@ -220,6 +239,20 @@ fn fs(in_: VertexOut) -> @location(0) vec4<f32> {
     var in = in_;
     in.uv = in_.uv * blit.uv_scale + blit.uv_offset;
     var c: vec3<f32>;
+    // the picture has at least 60 % of the screen's pixels each way (and not more than 1/16 over): one filtered read (two with the field
+    // blend). The sharp looks and the edge smoothing read 20 to 40 pixels for each screen pixel, which cost a phone's card as much as the
+    // whole game's drawing (~13 ms a frame at 2712 x 1220 on a Mali-G615) and have little to enlarge at these sizes.
+    let ratio = vec2<f32>(f32(blit.width), f32(blit.height)) / vec2<f32>(f32(blit.out_width), f32(blit.out_height));
+    if (all(ratio >= vec2<f32>(0.6)) && all(ratio <= vec2<f32>(1.0625))) {
+        let p = in.uv * vec2<f32>(f32(blit.width), f32(blit.height)) - 0.5;
+        var one = bilerp(p);
+        if (blit.blend == 2u) {  // the game moves every other field by half a line (interlace): the two latest fields together
+            let size = vec2<f32>(f32(blit.width), f32(blit.height));
+            let q = clamp(p, vec2<f32>(0.0), size - 1.0);
+            one = (one + textureSampleLevel(scene_before, scene_smooth, (q + 0.5) / vec2<f32>(textureDimensions(scene_before)), 0.0).rgb) * 0.5;
+        }
+        return vec4<f32>(one, 1.0);
+    }
     if (blit.width > blit.out_width + blit.out_width / 16u || blit.height > blit.out_height + blit.out_height / 16u) {
         return vec4<f32>(clamp(reduced_scene(in.uv), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
