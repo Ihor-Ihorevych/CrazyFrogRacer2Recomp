@@ -259,6 +259,12 @@ public class SpikeActivity extends SDLActivity implements SettingsPanel.Host {
         try { TouchOverlay.nativeDisplayMode(settings.display()); } catch (UnsatisfiedLinkError e) { /* native side not up yet */ }
     }
 
+    /** Settings > Move controls: the overlay's edit mode; the settings come back when the player taps Done. */
+    @Override
+    public void editControls() {
+        overlay.startEdit(new Runnable() { @Override public void run() { openSettings(); } });
+    }
+
     /** Relaunches the app in a fresh process (the resolution and the filter are read when the native side starts). */
     @Override
     public void restartGame() {

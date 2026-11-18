@@ -29,6 +29,7 @@ public class SettingsPanel extends FrameLayout {
     interface Host {
         void settingsChanged(boolean live);   // an applied (live) setting changed
         void restartGame();                    // resolution changed: the native side reads it only at start
+        void editControls();                   // close the panel and let the player drag the on-screen controls (TouchOverlay edit mode)
     }
 
     static final String TELEGRAM = "https://t.me/flipendodroid";
@@ -284,6 +285,16 @@ public class SettingsPanel extends FrameLayout {
         box.addView(shown, margin(wrap(), 0, 6, 0, 0));
         box.addView(text("Auto hides them while a gamepad is connected. Hidden is for a gamepad the phone does not report. The settings button stays.",
                          12, DIM, false), margin(wrap(), 0, 8, 0, 0));
+        TextView move = text("Move controls", 14, 0xFF1C1814, true);
+        move.setGravity(Gravity.CENTER);
+        move.setBackground(round(ACCENT, 18));
+        move.setPadding(dp(18), dp(10), dp(18), dp(10));
+        move.setOnClickListener(v -> {
+            if (getParent() instanceof ViewGroup) ((ViewGroup) getParent()).removeView(this);
+            host.editControls();
+        });
+        box.addView(move, margin(wrap(), 0, 12, 0, 0));
+        box.addView(text("Drag any button or the stick to a new place; Reset puts them back.", 12, DIM, false), margin(wrap(), 0, 6, 0, 0));
         return box;
     }
 

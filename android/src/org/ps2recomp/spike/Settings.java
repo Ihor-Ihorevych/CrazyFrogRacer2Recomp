@@ -50,6 +50,21 @@ public final class Settings {
     public boolean visible(String id) { return p.getBoolean("vis_" + id, !(id.equals("l1") || id.equals("l2") || id.equals("r2") || id.equals("select"))); }
 
     public void put(String key, int v) { p.edit().putInt(key, v).apply(); }
+    /** A control moved by the player (TouchOverlay's edit mode): its centre as a fraction of the screen's width and height, or null when it
+     *  keeps its place in the default layout. Keys posx_<id>, posy_<id> in 1/10000. */
+    public float[] position(String id) {
+        if (!p.contains("posx_" + id)) return null;
+        return new float[] {p.getInt("posx_" + id, 0) / 10000f, p.getInt("posy_" + id, 0) / 10000f};
+    }
+    public void putPosition(String id, float x, float y) {
+        p.edit().putInt("posx_" + id, Math.round(x * 10000)).putInt("posy_" + id, Math.round(y * 10000)).apply();
+    }
+    /** Every control back to the default layout. */
+    public void resetPositions() {
+        android.content.SharedPreferences.Editor e = p.edit();
+        for (String k : p.getAll().keySet()) if (k.startsWith("posx_") || k.startsWith("posy_")) e.remove(k);
+        e.apply();
+    }
     public void put(String key, boolean v) { p.edit().putBoolean(key, v).apply(); }
 
     /** Environment of the native side: read once when the game starts. */

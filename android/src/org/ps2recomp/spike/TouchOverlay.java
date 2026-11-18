@@ -79,6 +79,14 @@ public class TouchOverlay extends View implements InputManager.InputDeviceListen
     Drawable stickBase, stickThumb, modeIcon;
     int stickId = -1; float sx, sy, px, py;  // stick origin and thumb, in px
     int stickRadius;
+    // Edit mode (Settings > Move controls): the controls are dragged to new places, the game gets no input meanwhile; Done keeps the places
+    // (Settings.putPosition, fractions of the screen), Reset brings the default layout back.
+    boolean editing = false;
+    Runnable onEditDone;
+    int dragId = -1, dragWhat = -2;  // dragWhat: index into btns, -1 the stick
+    float dragDx, dragDy;
+    final RectF doneR = new RectF(), resetR = new RectF();
+    float stickCx = -1, stickCy = -1;  // the stick's home when the player moved it (px), -1 the default
     final long[] lastDown = new long[16];
     int heldNow, sentButtons = -1, sentX = -1, sentY = -1, touchMask;
     final InputManager im;
@@ -146,6 +154,7 @@ public class TouchOverlay extends View implements InputManager.InputDeviceListen
 
     /** Auto: hidden while a physical pad is connected; Force touch: always shown; Force gamepad: never shown. */
     void updateVisibility() {
+        if (editing) { setVisibility(View.VISIBLE); return; }
         boolean show = controlsMode == Settings.CONTROLS_TOUCH || (controlsMode == Settings.CONTROLS_AUTO && !padFound);
         setVisibility(show ? View.VISIBLE : View.GONE);
         if (!show) { stickId = -1; java.util.Arrays.fill(lastDown, 0); touchMask = 0; heldNow = 0; send(0, 128, 128); }
@@ -162,15 +171,86 @@ public class TouchOverlay extends View implements InputManager.InputDeviceListen
         float usable = w - insetL - insetR;
         for (Btn b : btns) {
             Def f = b.def;
+            float bw = f.w * d * scale, bh = f.h * d * scale;
+            float[] at = settings.position(f.id);
+            if (at != null && w > 0 && h > 0) {
+                float cx = at[0] * w, cy = at[1] * h;
+                b.r.set(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2);
+                continue;
+            }
             float x = insetL + f.ax * usable + f.dx * d * scale, y = f.ay * h + f.dy * d * scale;
-            b.r.set(x, y, x + f.w * d * scale, y + f.h * d * scale);
+            b.r.set(x, y, x + bw, y + bh);
         }
+        float[] st = settings.position(STICK.id);
+        if (st != null && w > 0 && h > 0) { stickCx = st[0] * w; stickCy = st[1] * h; } else { stickCx = stickCy = -1; }
+        float bw = 120 * d, bh = 44 * d, gap = 12 * d;
+        doneR.set(w / 2f + gap / 2, 16 * d, w / 2f + gap / 2 + bw, 16 * d + bh);
+        resetR.set(w / 2f - gap / 2 - bw, 16 * d, w / 2f - gap / 2, 16 * d + bh);
         float mx = insetL + MODE.ax * usable - (modeIcon != null ? 24 : 70) * d;  // the switch keeps its size
         modeBtn.r.set(mx, 12 * d, mx + (modeIcon != null ? 48 : 140) * d, 52 * d);
     }
 
-    float stickHomeX() { return insetL + 130 * d * scale; }
-    float stickHomeY() { return getHeight() - 110 * d * scale; }
+    float stickHomeX() { return stickCx >= 0 ? stickCx : insetL + 130 * d * scale; }
+    float stickHomeY() { return stickCy >= 0 ? stickCy : getHeight() - 110 * d * scale; }
+
+    /** Edit mode on: shown even when a gamepad hides the controls, the game's input released. `done` runs when the player taps Done. */
+    public void startEdit(Runnable done) {
+        editing = true;
+        onEditDone = done;
+        dragId = -1;
+        stickId = -1;
+        java.util.Arrays.fill(lastDown, 0);
+        touchMask = 0;
+        heldNow = 0;
+        send(0, 128, 128);
+        setVisibility(View.VISIBLE);
+        invalidate();
+    }
+
+    void endEdit() {
+        editing = false;
+        dragId = -1;
+        updateVisibility();
+        invalidate();
+        if (onEditDone != null) onEditDone.run();
+    }
+
+    boolean editTouch(MotionEvent e) {
+        int action = e.getActionMasked(), i = e.getActionIndex();
+        int w = getWidth(), h = getHeight();
+        if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
+            float x = e.getX(i), y = e.getY(i);
+            if (doneR.contains(x, y)) { endEdit(); return true; }
+            if (resetR.contains(x, y)) { settings.resetPositions(); layoutButtons(); invalidate(); return true; }
+            if (dragId >= 0) return true;
+            for (int k = btns.length - 1; k >= 0; k--) {
+                Btn b = btns[k];
+                if (b.visible && b.r.contains(x, y)) { dragId = e.getPointerId(i); dragWhat = k; dragDx = b.r.centerX() - x; dragDy = b.r.centerY() - y; return true; }
+            }
+            if (showStick && Math.hypot(x - stickHomeX(), y - stickHomeY()) <= stickRadius) {
+                dragId = e.getPointerId(i); dragWhat = -1; dragDx = stickHomeX() - x; dragDy = stickHomeY() - y;
+            }
+            return true;
+        }
+        if (dragId < 0) return true;
+        int at = e.findPointerIndex(dragId);
+        if (at < 0) { dragId = -1; return true; }
+        float cx = Math.max(0, Math.min(w, e.getX(at) + dragDx)), cy = Math.max(0, Math.min(h, e.getY(at) + dragDy));
+        if (dragWhat >= 0) {
+            Btn b = btns[dragWhat];
+            float bw = b.r.width(), bh = b.r.height();
+            b.r.set(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2);
+        } else {
+            stickCx = cx; stickCy = cy;
+        }
+        boolean up = action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL || (action == MotionEvent.ACTION_POINTER_UP && e.getPointerId(i) == dragId);
+        if (up && w > 0 && h > 0) {
+            settings.putPosition(dragWhat >= 0 ? btns[dragWhat].def.id : STICK.id, cx / w, cy / h);
+            dragId = -1;
+        }
+        invalidate();
+        return true;
+    }
 
     void drawIcon(Canvas c, Drawable ic, RectF r, float inset, int alpha) {
         ic.setBounds((int) (r.left + inset), (int) (r.top + inset), (int) (r.right - inset), (int) (r.bottom - inset));
@@ -179,6 +259,7 @@ public class TouchOverlay extends View implements InputManager.InputDeviceListen
     }
 
     @Override protected void onDraw(Canvas c) {
+        if (editing) c.drawColor(0x66000000);
         text.setColor((a(0xDD) << 24) | 0xFFFFFF);
         for (Btn b : btns) {
             if (!b.visible) continue;
@@ -218,9 +299,37 @@ public class TouchOverlay extends View implements InputManager.InputDeviceListen
             if (stickThumb != null) drawIcon(c, stickThumb, thumb, 0, stickId >= 0 ? 255 : a(0xB0));
             else { fill.setColor(((stickId >= 0 ? a(0x99) : a(0x50)) << 24) | 0xFFFFFF); c.drawCircle(tx, ty, tr, fill); }
         }
+        if (editing) drawEditChrome(c);
+    }
+
+    void drawEditChrome(Canvas c) {
+        Paint dash = new Paint(Paint.ANTI_ALIAS_FLAG);
+        dash.setStyle(Paint.Style.STROKE);
+        dash.setStrokeWidth(2 * d);
+        dash.setColor(0xFFE58A2E);
+        dash.setPathEffect(new android.graphics.DashPathEffect(new float[] {8 * d, 6 * d}, 0));
+        float g = 4 * d;
+        for (Btn b : btns) if (b.visible) c.drawRoundRect(new RectF(b.r.left - g, b.r.top - g, b.r.right + g, b.r.bottom + g), 10 * d, 10 * d, dash);
+        if (showStick) c.drawCircle(stickHomeX(), stickHomeY(), stickRadius + g, dash);
+        Paint t = new Paint(Paint.ANTI_ALIAS_FLAG);
+        t.setTextAlign(Paint.Align.CENTER);
+        t.setTextSize(15 * d);
+        t.setFakeBoldText(true);
+        for (int k = 0; k < 2; k++) {
+            RectF r = k == 0 ? doneR : resetR;
+            fill.setColor(k == 0 ? 0xFFE58A2E : 0xCC3A332C);
+            c.drawRoundRect(r, r.height() / 2, r.height() / 2, fill);
+            t.setColor(k == 0 ? 0xFF1C1814 : 0xFFF2EAE0);
+            c.drawText(k == 0 ? "Done" : "Reset", r.centerX(), r.centerY() + 5 * d, t);
+        }
+        t.setFakeBoldText(false);
+        t.setTextSize(13 * d);
+        t.setColor(0xFFF2EAE0);
+        c.drawText("Drag the controls where you want them", getWidth() / 2f, doneR.bottom + 24 * d, t);
     }
 
     @Override public boolean onTouchEvent(MotionEvent e) {
+        if (editing) return editTouch(e);
         int action = e.getActionMasked(), upIndex = (action == MotionEvent.ACTION_POINTER_UP) ? e.getActionIndex() : -1;
         if (action == MotionEvent.ACTION_CANCEL) { stickId = -1; recompute(0); return true; }
         int mask = 0, w = getWidth();
@@ -231,7 +340,9 @@ public class TouchOverlay extends View implements InputManager.InputDeviceListen
             boolean fresh = (action == MotionEvent.ACTION_DOWN) || (action == MotionEvent.ACTION_POINTER_DOWN && i == e.getActionIndex());
             if (fresh && modeBtn.visible && modeBtn.r.contains(x, y)) { dpadMode = !dpadMode; settings.put("dpad", dpadMode); continue; }
             int m = btnMask(x, y);
-            if (showStick && stickId < 0 && fresh && m == 0 && x < w * 0.4f && y > 70 * d) { stickId = id; sx = px = x; sy = py = y; continue; }
+            // the stick starts where the thumb lands: the left part of the screen, or around its place when the player moved it
+            boolean stickZone = stickCx >= 0 ? Math.hypot(x - stickCx, y - stickCy) < stickRadius * 2.2f : (x < w * 0.4f && y > 70 * d);
+            if (showStick && stickId < 0 && fresh && m == 0 && stickZone) { stickId = id; sx = px = x; sy = py = y; continue; }
             mask |= m;
         }
         int up = (action == MotionEvent.ACTION_UP) ? e.getPointerId(0) : (upIndex >= 0 ? e.getPointerId(upIndex) : -2);
