@@ -8,6 +8,7 @@ void start(const std::string &, const std::string &, const std::string &) {}
 void start(std::span<const std::uint8_t>, const std::string &, const std::string &) {}
 bool active() { return false; }
 bool translate_missing(std::uint32_t) { return false; }
+bool prebuild(const std::function<void(const std::string &)> &) { return false; }
 void frame_tick() {}
 }  // namespace ps2::ee::live
 
@@ -32,6 +33,7 @@ void frame_tick() {}
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -104,6 +106,7 @@ struct State {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> segments;   // the code the program itself has: {address, size}
     std::vector<std::pair<std::uint32_t, std::uint32_t>> file_segments;   // everything the executable's file fills, code or data: {address, size in memory}
     std::uint64_t stamp = 0;
+    std::map<std::uint32_t, int> aspect_knobs;   // PS2_ASPECT_KNOBS=<file> (lines "ADDRESS POWER", as games/<name>/aspect.txt): given to every translation
     std::vector<std::string> flags;
     std::vector<std::string> quick_flags; // for the first translation of a window, which the game waits for: fast to compile, slower code
     bool two_step = false;                // quick_flags differ from flags: such a library is followed by one made with flags, in the background
@@ -123,6 +126,7 @@ struct State {
     std::unique_ptr<recomp::StaticProgram> program_analysis;   // built at the first translation, for the calls into a window (under prep_mutex)
     std::vector<std::uint32_t> main_entries;
     bool analysed = false;
+    std::function<void(std::size_t, std::size_t)> compile_progress;   // prebuild(): reports the files compiled so far
     std::size_t libraries = 0;            // loaded from the cache or made in this run
     Clock::time_point began = Clock::now();
 
@@ -176,6 +180,7 @@ EeLiveHost &host() {
         x.watch_on = g_watch_on;
         x.watch_base = g_watch_base;
         x.watch_end = g_watch_end;
+        x.aspect_widen = g_aspect_widen;
         x.dispatch = &ps2::dispatch;
 #define X(R, name, params, args) x.name = &ps2::name;
         PS2_EE_LIVE_FUNCTIONS(X)
@@ -446,6 +451,7 @@ Built build_library(recomp::LiveRequest request, const std::string &what, bool b
                            (background ? "b" : "") + (quick ? "q" : "");
     request.prefix = "m_" + request.name + "_" + id + "_";
     request.stamp = g->stamp;
+    request.aspect_knobs = g->aspect_knobs;
     b.work = g->cache / ("work-" + id);
     const fs::path src = b.work / "src";
     std::error_code error;
@@ -490,6 +496,7 @@ Built build_library(recomp::LiveRequest request, const std::string &what, bool b
     job.cancel = cancel;
     job.hold = upgrade ? &g->priority_work : nullptr;   // a build that only improves code waits while a stop or a build the game may need is under way
     job.say = [](const std::string &text) { say("%s", text.c_str()); };
+    job.progress = g->compile_progress;
     b.files = job.sources.size();
     if (!lb::compile_and_link(job, b.timing)) return b;   // the compiler's messages were said
 
@@ -954,6 +961,21 @@ void start(std::span<const std::uint8_t> program, const std::string &cache, cons
     h = lb::fnv(h, elf.data(), elf.size());
     const std::size_t layout = sizeof(Cpu);
     h = lb::fnv(h, &layout, sizeof layout);
+    // the aspect knobs change the code made at their addresses: a library made with other knobs (or none) is not this runner's
+    if (const std::string path = ps2::os::env("PS2_ASPECT_KNOBS"); !path.empty()) {
+        std::ifstream in(path);
+        for (std::string line; std::getline(in, line);) {
+            if (const auto hash = line.find('#'); hash != std::string::npos) line.erase(hash);
+            unsigned address = 0;
+            int power = 0;
+            if (std::sscanf(line.c_str(), "%x %d", &address, &power) == 2 && power != 0) g->aspect_knobs[address] = power;
+        }
+        std::fprintf(stderr, "[ee-live] %zu aspect knobs from %s\n", g->aspect_knobs.size(), path.c_str());
+    }
+    for (const auto &[address, power] : g->aspect_knobs) {
+        h = lb::fnv(h, &address, sizeof address);
+        h = lb::fnv(h, &power, sizeof power);
+    }
     g->stamp = h;
 
     // What earlier runs left: load it now, and clear out what another version made.
@@ -1179,6 +1201,62 @@ void translate_program_calls(const std::vector<std::uint8_t> &image, std::uint32
         remember(request.name, request.base, request.image, mine, true);
         }
     }
+}
+
+bool prebuild(const std::function<void(const std::string &)> &progress) {
+    if (!g || !g->ready) return false;
+    const auto tell = [&](const std::string &text) {
+        say("%s", text.c_str());
+        if (progress) progress(text);
+    };
+    g->compile_progress = [&](std::size_t done, std::size_t total) { tell("compiled " + std::to_string(done) + " of " + std::to_string(total) + " files"); };
+    ensure_analysis();
+    std::uint32_t entry = 0;
+    if (g->program.size() >= 28) std::memcpy(&entry, g->program.data() + 24, 4);   // e_entry of the ELF header
+    bool all_ok = true;
+    for (const auto &[address, bytes] : g->segments) {
+        const std::uint32_t base = address & ~3u;
+        const std::uint32_t size = std::min<std::uint32_t>(bytes & ~3u, kRamSize - base);
+        if (size < 2 * recomp::kWindowUnit) continue;
+        recomp::LiveRequest request;
+        request.base = base;
+        request.image.assign(g_ram + base, g_ram + base + size);
+        request.name = "main_" + recomp::window_name(base, request.image.data(), request.image.size());
+        if (g->whole.count(request.name)) {
+            tell("the program's code at 0x" + lb::hex(base, 8) + " is translated already");
+            continue;
+        }
+        request.focused = false;
+        limit_to_new_code(request);   // the stretch the analysis reached is code, the rest of the segment data; the checks are sparse
+        request.entries = g->main_entries;
+        if (entry - base < size) request.entries.push_back(entry);
+        request.entries.erase(std::remove_if(request.entries.begin(), request.entries.end(), [&](std::uint32_t t) { return t - base >= size; }), request.entries.end());
+        std::sort(request.entries.begin(), request.entries.end());
+        request.entries.erase(std::unique(request.entries.begin(), request.entries.end()), request.entries.end());
+        request.candidates = function_starts(pointers_into(base, size));
+        tell("translating the program's code at 0x" + lb::hex(base, 8) + " (" + std::to_string(size / 1024) + " KiB, " + std::to_string(request.entries.size()) + " entry points, " +
+             std::to_string(request.candidates.size()) + " pointers into it)");
+        const auto began = Clock::now();
+        const Built built = while_pumping([&] { return build_library(request, "the program", false, nullptr, nullptr, false); });
+        if (!built.ok) {
+            if (!built.why.empty()) tell(built.why);
+            all_ok = false;
+            continue;
+        }
+        std::size_t modules = 0;
+        if (!load_library(built.library, modules, 1)) {
+            tell("the library made just now does not load (" + ps2::os::utf8(built.library.filename()) + ")");
+            all_ok = false;
+            continue;
+        }
+        g->whole.insert(request.name);
+        write_marker(request.name, false);
+        tell("the program's code at 0x" + lb::hex(base, 8) + " is ready: " + std::to_string(lb::seconds_since(began)) + " s (translate " + std::to_string(built.timing.generate) +
+             ", compile " + std::to_string(built.timing.compile) + ", link " + std::to_string(built.timing.link) + "), " + std::to_string(built.generated.code) + " instructions, " +
+             std::to_string(built.files) + " files");
+    }
+    g->compile_progress = nullptr;
+    return all_ok;
 }
 
 bool translate_missing(std::uint32_t pc) {

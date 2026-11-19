@@ -281,6 +281,128 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
     }
     if constexpr (Mode >= 2) std::memcpy(row_regs, &row, 16);
 }
+
+// A masked UNPACK (the write mask, VIF MASK register) with no filling (CL >= WL): the generic loop's lane rules, four lanes at a time. For
+// each of the four rows of the mask (the element's place in the write cycle, the fourth row for all later ones) every lane is 0 the
+// element (STMOD applied, the row registers kept in step only there), 1 the row register, 2 the column register of that row, 3 left as
+// memory holds it. Harry Potter 2 sends most of its vertex data this way: the scalar loop was ~10 % of a headless run.
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn, std::uint32_t Mode>
+void unpack_masked(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num, std::uint32_t *row_regs,
+                   std::uint32_t vmask, const std::uint32_t *col) {
+    constexpr std::size_t stride = static_cast<std::size_t>(Components) * Bits / 8;
+    VifU4 row;
+    std::memcpy(&row, row_regs, 16);
+    VifU4 sel0[4], sel1[4], sel2[4], keep[4], colv[4];
+    bool any_keep[4];
+    for (std::uint32_t r = 0; r < 4; ++r) {
+        any_keep[r] = false;
+        for (std::uint32_t j = 0; j < 4; ++j) {
+            const std::uint32_t m = (vmask >> ((r * 4 + j) * 2)) & 3u;
+            sel0[r][j] = m == 0 ? ~0u : 0u;
+            sel1[r][j] = m == 1 ? ~0u : 0u;
+            sel2[r][j] = m == 2 ? ~0u : 0u;
+            keep[r][j] = m == 3 ? ~0u : 0u;
+            any_keep[r] = any_keep[r] || m == 3;
+        }
+        colv[r] = VifU4{col[r], col[r], col[r], col[r]};
+    }
+    if constexpr (Mode <= 1) {
+        // The row registers do not change in these modes, so what the row and column lanes put in is one constant per row of the mask, and when no
+        // lane is left alone (the usual masks) an element is `(element & data lanes) | constant`: no read of the old qword, no per-element select
+        // of three masks. A write length of 1 (every element is the first of its cycle) takes row 0 for all of them.
+        VifU4 fixed[4];
+        for (std::uint32_t r = 0; r < 4; ++r) fixed[r] = (row & sel1[r]) | (colv[r] & sel2[r]);
+        // Lanes left alone (mask 3) add `old & keep[row]`: the old qword is read only when some row keeps a lane (two loops, no test per element).
+        const bool keeps = any_keep[0] || any_keep[1] || any_keep[2] || any_keep[3];
+        const auto run = [&](auto keep_tag) {
+            constexpr bool kKeep = decltype(keep_tag)::value;
+            const auto element = [&](std::uint32_t n) {
+                VifU4 vm = unpack_element<Bits, Components, Usn>(bytes + n * stride);
+                if constexpr (Mode == 1) vm = vm + row;
+                return vm;
+            };
+            if (wl <= 1) {
+                const VifU4 s0 = sel0[0], f0 = fixed[0], k0 = keep[0];
+                const std::size_t step = static_cast<std::size_t>(1u) + skip;
+                std::size_t at = addr;
+                for (std::uint32_t n = 0; n < num; ++n, at += step) {
+                    std::uint8_t *q = mem + (at & mask) * 16;
+                    VifU4 out = (element(n) & s0) | f0;
+                    if constexpr (kKeep) {
+                        VifU4 old;
+                        std::memcpy(&old, q, 16);
+                        out |= old & k0;
+                    }
+                    std::memcpy(q, &out, 16);
+                }
+            } else {
+                std::uint32_t cycle = 0;
+                for (std::uint32_t n = 0; n < num; ++n) {
+                    const std::uint32_t r = cycle < 3 ? cycle : 3;
+                    std::uint8_t *q = mem + static_cast<std::size_t>(addr & mask) * 16;
+                    VifU4 out = (element(n) & sel0[r]) | fixed[r];
+                    if constexpr (kKeep) {
+                        VifU4 old;
+                        std::memcpy(&old, q, 16);
+                        out |= old & keep[r];
+                    }
+                    std::memcpy(q, &out, 16);
+                    ++addr;
+                    if (++cycle >= wl) {
+                        addr += skip;
+                        cycle = 0;
+                    }
+                }
+            }
+        };
+        if (keeps) run(std::true_type{});
+        else run(std::false_type{});
+        return;
+    }
+    std::uint32_t cycle = 0;
+    for (std::uint32_t n = 0; n < num; ++n) {
+        const std::uint32_t r = cycle < 3 ? cycle : 3;
+        const VifU4 v = unpack_element<Bits, Components, Usn>(bytes + n * stride);
+        VifU4 vm = v;
+        if constexpr (Mode == 1 || Mode == 2) vm = v + row;
+        if constexpr (Mode >= 2) row = (vm & sel0[r]) | (row & ~sel0[r]);
+        std::uint8_t *q = mem + static_cast<std::size_t>(addr & mask) * 16;
+        VifU4 out = (vm & sel0[r]) | (row & sel1[r]) | (colv[r] & sel2[r]);
+        if (any_keep[r]) {
+            VifU4 old;
+            std::memcpy(&old, q, 16);
+            out |= old & keep[r];
+        }
+        std::memcpy(q, &out, 16);
+        ++addr;
+        if (++cycle >= wl) {
+            addr += skip;
+            cycle = 0;
+        }
+    }
+    if constexpr (Mode >= 2) std::memcpy(row_regs, &row, 16);
+}
+using MaskedUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t, std::uint32_t *, std::uint32_t,
+                              const std::uint32_t *);
+template <std::uint32_t Bits, std::uint32_t Mode>
+constexpr MaskedUnpack masked_pair(std::uint32_t components, bool usn) {
+    switch (components) {
+    case 1: return usn ? unpack_masked<Bits, 1, true, Mode> : unpack_masked<Bits, 1, false, Mode>;
+    case 2: return usn ? unpack_masked<Bits, 2, true, Mode> : unpack_masked<Bits, 2, false, Mode>;
+    case 3: return usn ? unpack_masked<Bits, 3, true, Mode> : unpack_masked<Bits, 3, false, Mode>;
+    default: return usn ? unpack_masked<Bits, 4, true, Mode> : unpack_masked<Bits, 4, false, Mode>;
+    }
+}
+// [STMOD][VL][VN][USN] as kFastMode (VL 3, V4-5, is not taken here)
+template <std::uint32_t Mode>
+constexpr MaskedUnpack kMaskedMode[4][4][2] = {
+    {{masked_pair<32, Mode>(1, false), masked_pair<32, Mode>(1, true)}, {masked_pair<32, Mode>(2, false), masked_pair<32, Mode>(2, true)}, {masked_pair<32, Mode>(3, false), masked_pair<32, Mode>(3, true)}, {masked_pair<32, Mode>(4, false), masked_pair<32, Mode>(4, true)}},
+    {{masked_pair<16, Mode>(1, false), masked_pair<16, Mode>(1, true)}, {masked_pair<16, Mode>(2, false), masked_pair<16, Mode>(2, true)}, {masked_pair<16, Mode>(3, false), masked_pair<16, Mode>(3, true)}, {masked_pair<16, Mode>(4, false), masked_pair<16, Mode>(4, true)}},
+    {{masked_pair<8, Mode>(1, false), masked_pair<8, Mode>(1, true)}, {masked_pair<8, Mode>(2, false), masked_pair<8, Mode>(2, true)}, {masked_pair<8, Mode>(3, false), masked_pair<8, Mode>(3, true)}, {masked_pair<8, Mode>(4, false), masked_pair<8, Mode>(4, true)}},
+    {{masked_pair<16, Mode>(1, false), masked_pair<16, Mode>(1, true)}, {masked_pair<16, Mode>(2, false), masked_pair<16, Mode>(2, true)}, {masked_pair<16, Mode>(3, false), masked_pair<16, Mode>(3, true)}, {masked_pair<16, Mode>(4, false), masked_pair<16, Mode>(4, true)}},
+};
+constexpr const MaskedUnpack (*kMaskedUnpack[4])[4][2] = {kMaskedMode<0>, kMaskedMode<1>, kMaskedMode<2>, kMaskedMode<3>};
+#define PS2_VIF_MASKED_FAST 1
 #elif defined(__SSE4_1__)
 // One element of an UNPACK as the four words it becomes in the vector unit's memory: sign or zero extended, a one-component element
 // repeated, a two-component element as x y x y, a three-component one with w = 0. Reads exactly the bytes of the element (the last
@@ -488,6 +610,26 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c
         u.num = 0;
         return;
     }
+#if defined(PS2_VIF_MASKED_FAST)
+    // PS2_VIF_MASKED=0: masked UNPACKs take the generic loop below as before. PS2_VIF_MASK_CHECK=1: each one runs both ways (the fast one
+    // on a copy of the memory and the row registers) and a difference is printed.
+    static const bool masked_fast = !std::getenv("PS2_VIF_MASKED") || std::getenv("PS2_VIF_MASKED")[0] != '0';
+    static const bool masked_check = std::getenv("PS2_VIF_MASK_CHECK") != nullptr;
+    static std::uint8_t check_mem[16384];
+    std::uint32_t check_row[4];
+    if (masked && masked_fast && !(wl > cl) && !(vn == 3 && vl == 3)) {
+        if (!masked_check) {
+            kMaskedUnpack[u.mode][vl][vn][usn ? 1 : 0](mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num, u.row, u.mask, u.col);
+            u.num = 0;
+            return;
+        }
+        std::memcpy(check_mem, mem, static_cast<std::size_t>(wrap) * 16);
+        std::memcpy(check_row, u.row, 16);
+        kMaskedUnpack[u.mode][vl][vn][usn ? 1 : 0](check_mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num, check_row, u.mask, u.col);
+        // the generic loop below writes the real memory; the two are compared after it
+    }
+    const bool compare_after = masked && masked_fast && masked_check && !(wl > cl) && !(vn == 3 && vl == 3);
+#endif
     for (std::uint32_t n = 0; n < num; ++n) {
         const bool fill = wl > cl && cycle >= cl;
         std::uint32_t value[4] = {0, 0, 0, 0};
@@ -530,6 +672,17 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c
             cycle = 0;
         }
     }
+#if defined(PS2_VIF_MASKED_FAST)
+    if (compare_after) {
+        static unsigned long long checked = 0, bad = 0;
+        ++checked;
+        if (std::memcmp(check_mem, mem, static_cast<std::size_t>(wrap) * 16) != 0 || std::memcmp(check_row, u.row, 16) != 0) {
+            if (++bad <= 10)
+                std::fprintf(stderr, "[vif-mask-check] MISMATCH unpack %08X mode %u mask %08X wl %u cl %u (%llu of %llu)\n", cmd, u.mode, u.mask, wl, cl, bad, checked);
+        }
+        if ((checked & 0xFFFFu) == 0) std::fprintf(stderr, "[vif-mask-check] %llu masked unpacks compared, %llu differ\n", checked, bad);
+    }
+#endif
     u.num = 0;
 }
 
@@ -559,6 +712,50 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &
     }
     u.code = cmd;
     if (!c.vu_thread) ++g_commands[unit][op];
+    // PS2_VIF_TRACE=<first>,<count>[,<unit>]: every decoded command of the unit (default 1) from command number <first> on: its words and
+    // what it means (UNPACK: format, flags, address with TOPS added, element count, cycle, mode, mask, row; MSCAL: the start address with
+    // the TOPS, ITOPS, BASE and OFFSET the program gets), with the first words of its data. Numbers count the commands that were
+    // executed for real (not the dry runs that only look ahead).
+    {
+        static const char *spec = std::getenv("PS2_VIF_TRACE");
+        static std::uint64_t first = 0, count = 0, number[2] = {0, 0};
+        static int trace_unit = 1;
+        static const bool parsed = [] {
+            if (spec) {
+                char *end = nullptr;
+                first = std::strtoull(spec, &end, 10);
+                count = end && *end == ',' ? std::strtoull(end + 1, &end, 10) : 1;
+                if (end && *end == ',') trace_unit = std::atoi(end + 1);
+            }
+            return true;
+        }();
+        (void)parsed;
+        if (spec && !c.dry && unit == trace_unit) {
+            const std::uint64_t k = ++number[unit];
+            if (k >= first && k < first + count) {
+                std::fprintf(stderr, "[vif%d-t] #%llu cmd %08X op %02X", unit, static_cast<unsigned long long>(k), cmd, op);
+                if ((op & 0x60u) == 0x60u) {
+                    std::uint32_t n = (cmd >> 16) & 0xFFu;
+                    if (!n) n = 256;
+                    std::fprintf(stderr, " UNPACK vn %u vl %u%s%s%s addr %03X%s num %u | CL %u WL %u mode %u mask %08X", (cmd >> 26) & 3u, (cmd >> 24) & 3u, (cmd >> 28) & 1u ? " masked" : "",
+                                 (cmd >> 14) & 1u ? " usn" : "", (cmd >> 15) & 1u ? " flg" : "", cmd & 0x3FFu, (cmd >> 15) & 1u ? "+TOPS" : "", n, u.cycle & 0xFFu, (u.cycle >> 8) & 0xFFu,
+                                 u.mode, u.mask);
+                    if ((cmd >> 15) & 1u) std::fprintf(stderr, " (TOPS %03X -> %03X)", u.tops, (cmd & 0x3FFu) + u.tops);
+                    std::fprintf(stderr, " row %08X %08X %08X %08X col %08X %08X %08X %08X", u.row[0], u.row[1], u.row[2], u.row[3], u.col[0], u.col[1], u.col[2], u.col[3]);
+                } else if (op == 0x14 || op == 0x15 || op == 0x17) {
+                    std::fprintf(stderr, " %s imm %04X | TOPS %03X ITOPS %03X BASE %03X OFFSET %03X DBF %d", op == 0x17 ? "MSCNT" : op == 0x15 ? "MSCALF" : "MSCAL", imm, u.tops, u.itops, u.base, u.ofst, u.dbf);
+                } else {
+                    std::fprintf(stderr, " imm %04X", imm);
+                }
+                if (data) {
+                    const std::uint32_t words = std::min<std::uint32_t>(4u, data_words(cmd, u));
+                    if (words) std::fprintf(stderr, " | data");
+                    for (std::uint32_t i = 0; i < words; ++i) std::fprintf(stderr, " %08X", data[i]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
     switch (op) {
     case 0x00: break;
     case 0x01:
@@ -597,7 +794,12 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &
         else gif::transfer(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
         break;
     default:
-        if ((op & 0x60u) == 0x60u) unpack(unit, cmd, data, c);
+        if ((op & 0x60u) == 0x60u) {
+            const bool watch = unit == 1 && !c.dry && vu::watching_vu1();
+            if (watch) vu::watch_vu1_snapshot();
+            unpack(unit, cmd, data, c);
+            if (watch) vu::watch_vu1_report("vif1 UNPACK", cmd, num, u.tops, u.base);
+        }
         else note_unknown(unit, cmd);
         break;
     }

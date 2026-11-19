@@ -334,6 +334,8 @@ fs::path find_compiler() {
         }
         return on_path(name);
     };
+    // PS2_LIVE_CXX: the compiler of a runner that has no other way to find one (the Android app brings clang as a library file of its own)
+    if (const fs::path p = usable(ps2::os::env("PS2_LIVE_CXX")); !p.empty()) return p;
     if (const fs::path p = usable(ps2::os::env("PS2_VU_CXX")); !p.empty()) return p;
     const fs::path exe = exe_directory();
     if (!exe.empty()) {
@@ -380,6 +382,19 @@ std::vector<std::string> compile_flags(const std::string &optimisation) {
     f.push_back("-fPIC");
     f.push_back("-fvisibility=hidden");
 #endif
+    // PS2_LIVE_FLAGS: more flags, separated by spaces, for every compile and the link (--target, --sysroot, -fuse-ld, --driver-mode=g++ for
+    // a compiler that is not called clang++ ...). They are part of the stamp of a library like the others.
+    {
+        const std::string extra = ps2::os::env("PS2_LIVE_FLAGS");
+        std::size_t at = 0;
+        while (at < extra.size()) {
+            while (at < extra.size() && extra[at] == ' ') ++at;
+            std::size_t end = at;
+            while (end < extra.size() && extra[end] != ' ') ++end;
+            if (end > at) f.push_back(extra.substr(at, end - at));
+            at = end;
+        }
+    }
     return f;
 }
 
@@ -415,7 +430,7 @@ bool compile_and_link(const Job &job, Timing &timing) {
     };
     std::vector<fs::path> objects;
     std::vector<std::pair<Process, std::size_t>> running;
-    std::size_t next = 0;
+    std::size_t next = 0, compiled = 0;
     bool ok = true;
     auto t = Clock::now();
     const auto reap = [&] {
@@ -441,6 +456,7 @@ bool compile_and_link(const Job &job, Timing &timing) {
         }
 #endif
         release(process);
+        if (code == 0 && job.progress) job.progress(++compiled, job.sources.size());
         if (code != 0) {
             ok = false;
             if (job.cancel && job.cancel->load()) return;

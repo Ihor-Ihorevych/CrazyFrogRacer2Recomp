@@ -59,6 +59,7 @@ struct EeLiveHost {
     std::uint8_t *spr;
     bool watch_on;                   // the write watch (memory.hpp), copied when the library is loaded
     std::uint32_t watch_base, watch_end;
+    float aspect_widen;              // g_aspect_widen (PS2_ASPECT over 4:3): what the aspect knobs scale by (generated.hpp aspect_word)
     void (*dispatch)(Cpu &c, std::uint32_t entry, std::uint32_t depth);
 #define X(R, name, params, args) R(*name) params;
     PS2_EE_LIVE_FUNCTIONS(X)
@@ -76,6 +77,7 @@ std::uint8_t *g_live_ram = nullptr;
 std::uint8_t *g_live_spr = nullptr;
 bool g_watch_on = false;
 std::uint32_t g_watch_base = 0, g_watch_end = 0;
+float g_aspect_widen = 1.0f;
 void dispatch(Cpu &c, std::uint32_t entry, std::uint32_t depth) { [[clang::musttail]] return g_ee_host->dispatch(c, entry, depth); }
 #define X(R, name, params, args) \
     R name params { return g_ee_host->name args; }

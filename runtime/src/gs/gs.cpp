@@ -91,7 +91,15 @@ std::uint32_t display_height(std::uint64_t disp, std::uint64_t smode2, bool crop
     const std::uint32_t magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
     std::uint32_t dh = (static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1;
     if ((smode2 & 3u) == 1u && dh / magv > 576) dh /= 2;
-    return shown_lines(dh, crop ? static_cast<std::uint32_t>(disp >> 12) & 0x7FFu : 0u, smode2) / magv;
+    std::uint32_t lines = shown_lines(dh, crop ? static_cast<std::uint32_t>(disp >> 12) & 0x7FFu : 0u, smode2) / magv;
+    // PS2_DISPLAY_ROWS=<n>: a main picture is shown with at most n lines. A PAL game that draws 448 lines in its 512 line frame (Harry Potter 2) fills the
+    // other 64 by stretching its last line: the overscan a TV does not show, and a smeared band on a phone's screen.
+    static const std::uint32_t cap = [] {
+        const char *v = std::getenv("PS2_DISPLAY_ROWS");
+        return v ? static_cast<std::uint32_t>(std::max(0, std::atoi(v))) : 0u;
+    }();
+    if (crop && cap && ps2::g_options.pal && lines > cap) lines = cap;
+    return lines;
 }
 // The two read circuits of the display (PMODE bits EN1 and EN2). With both on, the picture is circuit 2's, and circuit 1 shows over its own
 // rectangle of it, blended by PMODE's fixed alpha ALP (MMOD set, bits 8-15). Devil May Cry shows its typed message windows this way: a
@@ -1443,7 +1451,11 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
             if (!cpu_at_start) cpu_at_start = step_cpu;
         }
         switch (h.type) {
-        case queue::kGif: gif::render(static_cast<int>(h.arg0), payload, h.arg1); break;
+        case queue::kGif: {
+            const prof::Scope gs_scope(prof::kRGs);  // PS2_PROF: the playback of the GS stream (the renderer's parts set their own labels inside)
+            gif::render(static_cast<int>(h.arg0), payload, h.arg1);
+            break;
+        }
         case queue::kGifReset: gif::render_reset(); break;
         case queue::kReset: render_reset(); break;
         case queue::kSoftReset: soft_reset(); break;

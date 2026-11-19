@@ -102,6 +102,7 @@ struct LiveRequest {
     std::vector<std::uint32_t> candidates;  // words of memory that point into the image: possible function starts (Search::candidates)
     std::uint32_t text_begin = 0, text_end = 0;   // not 0: the image holds code only in [text_begin, text_end), the rest is data and no pointer into it is a function
     std::vector<std::uint32_t> served;      // calls and jumps to these addresses of the image are not followed: something else translated them (Search::served)
+    std::map<std::uint32_t, int> aspect_knobs;  // CodegenOptions::aspect_knobs (PS2_ASPECT_KNOBS): the camera's constants that follow the screen's shape
 };
 
 struct LiveResult {

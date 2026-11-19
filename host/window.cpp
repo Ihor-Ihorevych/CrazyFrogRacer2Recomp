@@ -1457,8 +1457,14 @@ void pace() {
         const double steer = std::clamp((g_pipe->queued_ms() - kSteerMs) / kSteerMs * 0.02, -0.01, 0.01);
         const auto period = static_cast<std::uint64_t>(frequency / (ps2::g_options.pal ? 50.0 : 60.0) * (1.0 + steer));
         const std::uint64_t now = SDL_GetPerformanceCounter();
-        // more than two frames behind (a load, a hold): start counting again from now rather than rushing to catch up
-        if (g_last && now < g_last + 2 * period) {
+        // more than kCatchUp frames behind (a load, a hold): start counting again from now rather than rushing to catch up. A game that draws every
+        // second field (Harry Potter 2: a drawn field takes up to two periods, the empty one after it takes none) needs the room: with two periods the clock
+        // restarted after every long field and the empty one after it still waited a whole period (31 fields a second where 45 were possible).
+        static const std::uint64_t kCatchUp = [] {
+            const std::string v = ps2::os::env("PS2_CATCHUP");
+            return v.empty() ? 4u : static_cast<std::uint64_t>(std::clamp(std::atoi(v.c_str()), 2, 16));
+        }();
+        if (g_last && now < g_last + kCatchUp * period) {
             g_last += period;
             wait_until(g_last);
         } else {
@@ -1836,6 +1842,9 @@ bool open_window(bool fullscreen) {
     g_pad_log = !pad_log.empty() && pad_log != "0";
     if (!script.empty()) SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");  // Android: the phone's tilt sensor is not a game controller
+#ifdef __ANDROID__
+    SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD, "0");      // Android: the game takes no text, the on-screen keyboard must not come up
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
@@ -1910,6 +1919,9 @@ bool open_window(bool fullscreen) {
     }
     SDL_ShowWindow(g_window);
     SDL_RaiseWindow(g_window);
+#ifdef __ANDROID__
+    SDL_StopTextInput();   // SDL2 starts text input with the window; on the phone that shows the keyboard (the game has no text field)
+#endif
 #ifdef _WIN32
     SDL_SysWMinfo wm_info;
     SDL_VERSION(&wm_info.version);

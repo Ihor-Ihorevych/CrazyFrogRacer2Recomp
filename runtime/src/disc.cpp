@@ -111,7 +111,94 @@ void self_check();
 
 }
 
+namespace {
+
+// A raw CD image (a BIN: every sector 2352 bytes, with a 12-byte sync, a 4-byte header and, in mode 2, an 8-byte subheader before the
+// 2048 bytes of the file system). The file system only ever sees the 2048 bytes, so the image is read through a reader that maps the
+// virtual sector to its place in the file; nothing is converted or copied.
+struct RawLayout {
+    std::uint32_t stride = 2048, skip = 0;
+    bool raw = false;
+};
+
+RawLayout raw_cd_layout(std::FILE *file, std::uint64_t offset) {
+    RawLayout out;
+    unsigned char head[16];
+#if defined(_WIN32)
+    if (_fseeki64(file, static_cast<long long>(offset), SEEK_SET) != 0) return out;
+#else
+    if (fseeko(file, static_cast<off_t>(offset), SEEK_SET) != 0) return out;
+#endif
+    if (std::fread(head, 1, sizeof head, file) != sizeof head) return out;
+    static const unsigned char sync[12] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0};
+    if (std::memcmp(head, sync, sizeof sync) != 0) return out;
+    if (head[15] == 1) out = {2352, 16, true};
+    else if (head[15] == 2) out = {2352, 24, true};
+    return out;
+}
+
+bool has_extension(const std::string &path, const char *ext) {
+    const std::size_t n = std::strlen(ext);
+    if (path.size() < n) return false;
+    for (std::size_t i = 0; i < n; ++i)
+        if (std::tolower(static_cast<unsigned char>(path[path.size() - n + i])) != ext[i]) return false;
+    return true;
+}
+
+// The image a CUE sheet names. The file name inside a sheet often does not match the file next to it (a renamed BIN is common), so
+// when the named file is missing the one image file in the sheet's folder is taken.
+std::string cue_image(const std::string &cue) {
+    std::FILE *f = os::open(cue, "rb");
+    if (!f) return {};
+    static char text[65536];
+    const std::size_t n = std::fread(text, 1, sizeof text - 1, f);
+    std::fclose(f);
+    text[n] = 0;
+    const std::filesystem::path sheet = os::path(cue);
+    const std::filesystem::path dir = sheet.has_parent_path() ? sheet.parent_path() : std::filesystem::path(".");
+    std::error_code ec;
+    const char *at = std::strstr(text, "FILE");
+    if (!at) at = std::strstr(text, "file");
+    if (at) {
+        at += 4;
+        while (*at == ' ' || *at == '\t') ++at;
+        std::string name;
+        if (*at == '"') {
+            ++at;
+            while (*at && *at != '"' && *at != '\r' && *at != '\n') name += *at++;
+        } else {
+            while (*at && *at != ' ' && *at != '\t' && *at != '\r' && *at != '\n') name += *at++;
+        }
+        if (!name.empty()) {
+            const std::filesystem::path named = os::path(name);
+            for (const std::filesystem::path &candidate : {dir / named, dir / named.filename()})
+                if (std::filesystem::is_regular_file(candidate, ec)) return os::utf8(candidate);
+        }
+    }
+    std::string only;
+    int count = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = os::utf8(entry.path());
+        if (has_extension(name, ".bin") || has_extension(name, ".img") || has_extension(name, ".iso")) {
+            only = name;
+            ++count;
+        }
+    }
+    return count == 1 ? only : std::string();
+}
+
+}  // namespace
+
 bool open(const std::string &path) {
+    if (has_extension(path, ".cue")) {
+        const std::string image = cue_image(path);
+        if (image.empty()) {
+            std::fprintf(stderr, "[disc] %s: the CUE sheet names no image file that can be found next to it\n", path.c_str());
+            return false;
+        }
+        std::fprintf(stderr, "[disc] CUE sheet %s: image %s\n", path.c_str(), image.c_str());
+        return open(image);
+    }
     if ((path == kBundleSentinel && open_bundle(path)) || open_folder(path) || open_bundle(path)) {
         if (g_file) {
             std::fclose(g_file);
@@ -153,9 +240,35 @@ bool open(const std::string &path) {
     }
     // A second image (a disc swap) replaces the first: its file is closed once the reader no longer uses it, so it is neither
     // leaked nor kept locked.
+    const RawLayout raw = raw_cd_layout(file, slice_at);
+    if (raw.raw) {
+        const std::uint64_t sectors = static_cast<std::uint64_t>(end) / raw.stride;
+        std::fprintf(stderr, "[disc] %s: raw CD image, %llu sectors of %u bytes, file system data at byte %u of each\n", path.c_str(),
+                     static_cast<unsigned long long>(sectors), raw.stride, raw.skip);
+        end = static_cast<long long>(sectors * kSector);
+    }
     std::FILE *previous = g_file;
     g_file = file;
-    const bool opened = open(path, static_cast<std::uint64_t>(end), [file, slice_at](std::uint64_t offset, void *out, std::size_t bytes) -> std::size_t {
+    const bool opened = open(path, static_cast<std::uint64_t>(end), [file, slice_at, raw](std::uint64_t offset, void *out, std::size_t bytes) -> std::size_t {
+        if (raw.raw) {
+            // the bytes asked for, sector by sector (a request is usually one sector or a run of whole ones)
+            std::size_t done = 0;
+            auto *dst = static_cast<std::uint8_t *>(out);
+            while (done < bytes) {
+                const std::uint64_t at = offset + done, sector = at / kSector, inside = at % kSector;
+                const std::size_t take = std::min<std::size_t>(bytes - done, kSector - inside);
+                const std::uint64_t file_at = slice_at + sector * raw.stride + raw.skip + inside;
+#if defined(_WIN32)
+                if (_fseeki64(file, static_cast<long long>(file_at), SEEK_SET) != 0) break;
+#else
+                if (fseeko(file, static_cast<off_t>(file_at), SEEK_SET) != 0) break;
+#endif
+                const std::size_t got = std::fread(dst + done, 1, take, file);
+                done += got;
+                if (got != take) break;
+            }
+            return done;
+        }
         offset += slice_at;
         // A failed seek reads nothing (read() then says "short read") instead of the sectors at the old position.
 #if defined(_WIN32)

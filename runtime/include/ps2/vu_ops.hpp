@@ -701,6 +701,18 @@ PS2_VU_INLINE v4u vfix(v4u x) {
     const __m128 normal = _mm_cmpge_ps(clamped, _mm_castsi128_ps(_mm_set1_epi32(0x00800000)));
     return (v4u)_mm_or_si128(_mm_and_si128(xi, _mm_set1_epi32(static_cast<int>(0x80000000u))), _mm_castps_si128(_mm_and_ps(clamped, normal)));
 }
+#elif defined(__aarch64__)
+// The same on every one of the 2^32 inputs (vfix_generic's formula, with the "is it a normal number" test on the magnitude itself instead of
+// the clamped one: the clamp keeps everything above 0x00800000 above it, so the compare gives the same answer and runs beside the clamp):
+// bic, then umin and cmhs side by side, and, bsl: four steps in a row where the generic form has five, and every add and multiply of a vector program ends
+// in one of these (they are one long chain, which is where the time goes).
+PS2_VU_INLINE v4u vfix(v4u x) {
+    const uint32x4_t xi = (uint32x4_t)x;
+    const uint32x4_t magnitude = vandq_u32(xi, vdupq_n_u32(0x7FFFFFFFu));
+    const uint32x4_t clamped = vminq_u32(magnitude, vdupq_n_u32(0x7F7FFFFFu));
+    const uint32x4_t normal = vcgeq_u32(magnitude, vdupq_n_u32(0x00800000u));
+    return (v4u)vbslq_u32(vdupq_n_u32(0x80000000u), xi, vandq_u32(clamped, normal));
+}
 #else
 PS2_VU_INLINE v4u vfix(v4u x) { return vfix_generic(x); }
 #endif
@@ -836,7 +848,21 @@ PS2_VU_INLINE void flags(Vu0Regs &r, v4u v, unsigned dest) {
 }
 #endif
 
-PS2_VU_INLINE std::uint32_t clip_value(const Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
+// The six clip bits of a CLIP instruction (lane x: bit 0 above +w, bit 1 below -w; y: 2 and 3; z: 4 and 5), on four lanes at once. Same bits as the
+// per-lane loop it replaces (kept below as clip_flags_scalar, which the tests compare it with): a lane is compared by fp::key (a denormal is
+// zero, the sign makes the magnitude negative) with the key of |w|. The scalar loop was ~60 instructions of compares and selects on ARM.
+PS2_VU_INLINE std::uint32_t clip_flags(v4u x, std::uint32_t w) {
+    const std::uint32_t wa = w & 0x7FFFFFFFu;
+    const std::int32_t lim = (wa & 0x7F800000u) ? static_cast<std::int32_t>(wa) : 0;
+    const v4u normal = (v4u)((x & 0x7F800000u) != 0u);                 // all ones where the exponent is not zero
+    const v4i magnitude = (v4i)(x & 0x7FFFFFFFu & normal);               // flushed
+    const v4i negative = (v4i)((v4i)x < 0);                              // all ones where the sign is set
+    const v4i key = (magnitude ^ negative) - negative;                   // -magnitude where negative
+    const v4i limit = {lim, lim, lim, lim};
+    const v4u above = (v4u)(key > limit), below = (v4u)(key < -limit);
+    return __builtin_reduce_or((above & v4u{1u, 4u, 16u, 0u}) | (below & v4u{2u, 8u, 32u, 0u}));
+}
+PS2_VU_INLINE std::uint32_t clip_flags_scalar(const Reg128 &s, std::uint32_t w) {
     const std::int32_t lim = fp::key(w & fp::kAbs);
     std::uint32_t f = 0;
     for (int i = 0; i < 3; ++i) {
@@ -844,18 +870,15 @@ PS2_VU_INLINE std::uint32_t clip_value(const Vu0Regs &r, const Reg128 &s, std::u
         if (x > lim) f |= 1u << (i * 2);
         if (x < -lim) f |= 2u << (i * 2);
     }
-    return ((r.clip << 6) | f) & 0xFFFFFFu;
+    return f;
+}
+
+PS2_VU_INLINE std::uint32_t clip_value(const Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
+    return ((r.clip << 6) | clip_flags(vload(s), w)) & 0xFFFFFFu;
 }
 
 PS2_VU_INLINE void clip(Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
-    const std::int32_t lim = fp::key(w & fp::kAbs);
-    std::uint32_t f = 0;
-    for (int i = 0; i < 3; ++i) {
-        const std::int32_t x = fp::key(s.w[i]);
-        if (x > lim) f |= 1u << (i * 2);
-        if (x < -lim) f |= 2u << (i * 2);
-    }
-    r.clip = ((r.clip << 6) | f) & 0xFFFFFFu;
+    r.clip = ((r.clip << 6) | clip_flags(vload(s), w)) & 0xFFFFFFu;
 }
 
 // The MAC, status and clip flags an instruction sets can be read four cycles later, and `t` counts cycles, not instructions:

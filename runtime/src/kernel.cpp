@@ -252,6 +252,7 @@ void run_dmac(Cpu &c, unsigned channel) {
     for (const Handler &h : handlers) {
         if (h.cause != channel) continue;
         const std::int32_t result = static_cast<std::int32_t>(run_guest(c, h.address, channel, h.arg, 0, h.gp));
+        if (trace) std::fprintf(stderr, "[dmac]   handler 0x%08X arg 0x%08X -> %d\n", h.address, h.arg, result);
         if (result < 0) break;
     }
 }
@@ -1176,6 +1177,10 @@ std::uint32_t eret(Cpu &c) {
 
 void set_interrupts(Cpu &c, bool enabled) {
     const bool was = kernel::interrupts_enabled();
+    // DI: an interrupt that came before it is taken before it. Transfers end in no time here, so the handler of a channel that finished
+    // just before a DI (Harry Potter 2's film player: DI, DisableDmac(3), EI after starting a picture's output) had not run yet, and the
+    // call masked a channel whose completion the game's handler (it chains the next 32768 quadwords of the output) never saw.
+    if (!enabled && was) kernel::take_pending(c);
     c.cop0[12] = enabled ? (c.cop0[12] | 0x10000u) : (c.cop0[12] & ~0x10000u);
     if (enabled && !was) kernel::take_pending(c);
 }

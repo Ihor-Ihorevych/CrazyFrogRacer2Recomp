@@ -81,6 +81,7 @@ struct Job {
     const std::atomic<int> *hold = nullptr;     // above 0: start no more compilers for now (the game waits for another build, which should have the processors); running ones go on
     const std::atomic<bool> *urgent = nullptr;  // set while the game waits for this job (ee_live.cpp, background translation): normal priority from then on
     std::function<void(const std::string &)> say;  // one line of the log
+    std::function<void(std::size_t, std::size_t)> progress;  // set: called with (files compiled, files in all) after each compiled file
 };
 struct Timing {
     double generate = 0, compile = 0, link = 0;

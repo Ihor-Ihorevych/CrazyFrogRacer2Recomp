@@ -966,8 +966,8 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
     // are zero" bit of the processor for the body (when the program has float arithmetic at all) and does a hop to the interpreter
     // after it.
     const std::string head = !lazy ? std::format("void {}(Vu0Regs &r, std::uint8_t *mem) {{\n", name)
-                             : any_arith ? std::format("PS2_VU_BODY void {}_b(Vu0Regs &r, std::uint8_t *mem, VuDaz &daz, std::uint32_t &hop) {{\n    (void)daz;\n", name)
-                                         : std::format("static inline __attribute__((always_inline)) void {}_b(Vu0Regs &r, std::uint8_t *mem, std::uint32_t &hop) {{\n", name);
+                             : any_arith ? std::format("PS2_VU_BODY void {}_b(Vu0Regs &__restrict__ r, std::uint8_t *mem, VuDaz &daz, std::uint32_t &hop) {{\n    (void)daz;\n", name)
+                                         : std::format("static inline __attribute__((always_inline)) void {}_b(Vu0Regs &__restrict__ r, std::uint8_t *mem, std::uint32_t &hop) {{\n", name);
     // The MAC flags worked out where they are read (vu-sticky): for VU1 programs that read the MAC flags but not the status. The
     // flag sites stay the same (live_in above), so the reader, the next program and the interpreter see the same bits.
     // A VU1 program that reads no flags at all still leaves the MAC and status of its last results, as the interpreter
@@ -1040,6 +1040,11 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         if (set_bi.count(pc)) body += std::format("bi = {}u; ", std::max(def[pc], 0));
         body += u.post;
         if (!(hi & 0x80000000u) && l.supported) body += l.after_upper;
+        // XGKICK is read by the GIF one pair late (runtime/src/vu_micro.cpp, xgkick): the pair after a kick says the kick may go out, once its
+        // own stores are done. 0xFFFF is no address, it is that message (vu::kick); the replacements of "vu::kick(1, " below give it the same
+        // MXCSR handling as a kick.
+        if (const auto prev_pair = lowers.find((pc - 8u) & kMask); prev_pair != lowers.end() && p.unit == 1 && prev_pair->second.code.find("vu::kick(") != std::string::npos)
+            body += "vu::kick(1, 0xFFFFu); ";
         std::string stop;
         if (p.unit == 0) {
             stop = std::format("if (steps >= 1000000u) {{ std::fprintf(stderr, \"[vu0] program at 0x{:04X} did not end\\n\"); return; }} ", p.entry);
@@ -1142,6 +1147,20 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
                  {"vaddd(", "vaddn("}, {"vsubd(", "vsubn("}, {"vmuld(", "vmuln("}, {"vmaddd(", "vmaddn("}, {"vmsubd(", "vmsubn("}, {"vshadow(", "vshadow_eager("}, {"vqd(", "vqd_eager("}})
             replace_all(o, from, to);
         o = local_vi(o);
+        // A jump to the program's own first pair (a loop over vertices: ~25 % of the hops between programs in Harry Potter 2) goes round in the
+        // function: everything the way out does (the flags and the integer registers into the register file) is done, and instead of the hop
+        // to the dispatcher, which would look the same program up and call it again, the function starts again at its top (`again:`, before
+        // the flag pipeline and the register copies are made: the same entry code as a call). PS2_VU_NO_LOOPBACK=1 at generation time
+        // (vurecomp, the environment of the generator) leaves it out.
+        static const bool no_loopback = std::getenv("PS2_VU_NO_LOOPBACK") != nullptr;
+        if (!no_loopback && !dyn && delay.empty()) {
+            const std::size_t d = o.rfind("dispatch:\n");
+            const std::size_t call = d == std::string::npos ? std::string::npos : o.find("vu::interpret(1, jpc);", d);
+            if (call != std::string::npos) {
+                o.insert(call, std::format("if (jpc == {}) goto again; ", addr(p.entry & kMask)));
+                o.insert(head.size(), "again:\n");
+            }
+        }
         if (sticky_split) {
             o.replace(0, head.size(), std::format("template <bool kSticky>\nstatic void {}_s(Vu0Regs &r, std::uint8_t *mem) {{\n", name));
             o += std::format("static __attribute__((noinline, cold)) void {0}_c(Vu0Regs &r, std::uint8_t *mem) {{ {0}_s<true>(r, mem); }}\n\n", name);
@@ -1175,7 +1194,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp). 16: VU1 programs keyed by program_key_moved, with the shift `sh` in them.
-const char *const kGeneratorVersion = "vurecomp 16";
+const char *const kGeneratorVersion = "vurecomp 19";   // 19: the register file of a lazy program body is __restrict__ (the compiler keeps registers in machine registers across the stores to the data memory; the body hands over with vhop and returns, nothing else touches the registers meanwhile); 18: a jump to the program's own entry goes round inside the function (again:); 17: a kick goes out one pair late (vu::kick(1, 0xFFFF) after the pair that follows it)
 
 // The key a program is built and found under, worked out from its code: VU0 keeps program_key (the address counts), VU1 has program_key_moved
 // (the same code at any address is one program). A recording of the old kind (VU1, its name holds a key that counted the address) is a

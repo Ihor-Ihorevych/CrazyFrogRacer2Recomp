@@ -768,7 +768,20 @@ private:
         case Slti: set_d(rt, std::format("{} < {}ll ? 1ull : 0ull", sd(rs), i.simm())); break;
         case Sltiu: set_d(rt, std::format("{} < static_cast<std::uint64_t>({}ll) ? 1ull : 0ull", d(rs), i.simm())); break;
         case Andi: set_d(rt, std::format("{} & {}", d(rs), uimm(i))); break;
-        case Ori: set_d(rt, std::format("{} | {}", d(rs), uimm(i))); break;
+        case Ori:
+            // an aspect knob's lui followed by the ori of its low half into the same register: the whole float is scaled (the knob's lui
+            // alone only scales the high half, and the ori would then OR the original low bits into the scaled value)
+            if (rt && rs == rt && i.pc >= 4) {
+                if (const auto k = options_.aspect_knobs.find(i.pc - 4); k != options_.aspect_knobs.end()) {
+                    const Insn hi = fetch(i.pc - 4);
+                    if (hi.op == Lui && hi.rt() == rt) {
+                        line(std::format("c.r[{}].sd[0] = static_cast<std::int32_t>(aspect_word({}, {}));", rt, hex((hi.uimm() << 16) | i.uimm()), k->second));
+                        break;
+                    }
+                }
+            }
+            set_d(rt, std::format("{} | {}", d(rs), uimm(i)));
+            break;
         case Xori: set_d(rt, std::format("{} ^ {}", d(rs), uimm(i))); break;
         case Lui:
             if (!rt) break;
@@ -926,7 +939,12 @@ private:
         case AddS: line(std::format("{} = fp::ee::add(c.fcr31, {}, {});", f(i.fd()), f(i.fs()), f(i.ft()))); break;
         case SubS: line(std::format("{} = fp::ee::sub(c.fcr31, {}, {});", f(i.fd()), f(i.fs()), f(i.ft()))); break;
         case MulS: line(std::format("{} = fp::ee::mul(c.fcr31, {}, {});", f(i.fd()), f(i.fs()), f(i.ft()))); break;
-        case DivS: line(std::format("{} = fp::ee::div(c.fcr31, {}, {});", f(i.fd()), f(i.fs()), f(i.ft()))); break;
+        case DivS:
+            line(std::format("{} = fp::ee::div(c.fcr31, {}, {});", f(i.fd()), f(i.fs()), f(i.ft())));
+            // an aspect knob on a division: its quotient follows the screen's shape (a camera scale that is computed, not loaded with lui)
+            if (const auto k = options_.aspect_knobs.find(i.pc); k != options_.aspect_knobs.end())
+                line(std::format("{} = aspect_word({}, {});", f(i.fd()), f(i.fd()), k->second));
+            break;
         case SqrtS: line(std::format("{} = fp::ee::sqrt(c.fcr31, {});", f(i.fd()), f(i.ft()))); break;
         case AbsS: line(std::format("{} = {} & fp::kAbs;", f(i.fd()), f(i.fs()))); break;
         case MovS: line(std::format("{} = {};", f(i.fd()), f(i.fs()))); break;
@@ -1142,7 +1160,8 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
                  "    ps2::g_live_spr = host->spr;\n"
                  "    ps2::g_watch_on = host->watch_on;\n"
                  "    ps2::g_watch_base = host->watch_base;\n"
-                 "    ps2::g_watch_end = host->watch_end;\n";
+                 "    ps2::g_watch_end = host->watch_end;\n"
+                 "    ps2::g_aspect_widen = host->aspect_widen;\n";
         table << "    *count = " << module_count << "u;\n    return gen::kModules;\n}\n\n";
         table << "PS2_LIVE_EXPORT const std::uint32_t *ps2_ee_live_soft(std::uint32_t module, std::uint32_t *count) {\n    *count = 0;\n    switch (module) {\n"
               << soft_cases.str() << "    default: break;\n    }\n    return nullptr;\n}\n";

@@ -14,6 +14,7 @@
 #include "ps2/disc.hpp"
 #include "ps2/ee_live.hpp"
 #include "kernel.hpp"
+#include "prov.hpp"
 #include "load_stats.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
@@ -416,6 +417,7 @@ void vblank() {
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && frame_capture_requested(g_frames)) dump_frame();
+    if (prov::g_on) prov::frame_end(g_frames);
     hw::vblank_start();
     iop::vblank(true);
     schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });
@@ -752,6 +754,7 @@ static void setup_pace() {
 }
 
 void boot(std::uint32_t entry, const std::vector<std::string> &args) {
+    prov::init();
     init_watch();
     hw::reset();
     kernel::reset();
@@ -1003,7 +1006,11 @@ void run_vu_thread() {
         if (batch) out.hold();
         while (in.peek(h, payload)) {
             switch (h.type) {
-            case gs::queue::kVif1: vif::transfer_words(1, reinterpret_cast<const std::uint32_t *>(payload), h.arg0); break;
+            case gs::queue::kVif1: {
+                const prof::Scope vif_scope(prof::kVVif);
+                vif::transfer_words(1, reinterpret_cast<const std::uint32_t *>(payload), h.arg0);
+                break;
+            }
             case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
             case gs::queue::kGif: gif::transfer(static_cast<int>(h.arg0), payload, h.arg1); break;
             case gs::queue::kPath3Idle: gif::vif1_idle(); break;
@@ -1353,7 +1360,23 @@ void enter_thread(Thread thread) {
             if (count == 0 || count == n) CPU_ZERO(&set);  // unknown or all alike: leave the scheduler alone
             return set;
         }();
-        if (CPU_COUNT(&big) > 0 && !std::getenv("PS2_NO_PIN")) sched_setaffinity(0, sizeof big, &big);
+        // PS2_PIN=g,v,r,t: one processor each for the game (emulation), vector unit, drawing and tile threads ('-' keeps the group above for that
+        // thread): a heavy thread alone on a core keeps that core's clock up (a core shared by several threads is seen as lightly loaded between
+        // their bursts and slows down). PS2_NO_PIN=1 leaves all of it to the system.
+        cpu_set_t mine = big;
+        if (const char *pin = std::getenv("PS2_PIN")) {
+            const int index = thread == Thread::Game ? 0 : thread == Thread::VectorUnit ? 1 : thread == Thread::Gpu ? 2 : 3;
+            const char *p = pin;
+            for (int i = 0; i < index && p; ++i) {
+                p = std::strchr(p, ',');
+                if (p) ++p;
+            }
+            if (p && *p >= '0' && *p <= '9') {
+                CPU_ZERO(&mine);
+                CPU_SET(std::atoi(p), &mine);
+            }
+        }
+        if (CPU_COUNT(&mine) > 0 && !std::getenv("PS2_NO_PIN")) sched_setaffinity(0, sizeof mine, &mine);
     }
 #endif
     if (g_hook) g_hook();

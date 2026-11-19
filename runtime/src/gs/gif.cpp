@@ -4,6 +4,7 @@
 #include "queue.hpp"
 #include "../vif.hpp"
 #include "../vu_micro.hpp"
+#include "../prov.hpp"
 
 #include "ps2/state.hpp"
 
@@ -367,6 +368,7 @@ void end_runaway_kick(std::uint32_t address) {
 }
 
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (prov::g_on) prov::gif_path(path);
     if (path & kEndPacket) [[unlikely]] {  // the message above, should it come through the vector thread's queue
         end_runaway_kick(qwc);
         return;

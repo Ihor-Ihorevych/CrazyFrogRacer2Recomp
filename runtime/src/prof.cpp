@@ -17,9 +17,14 @@
 #include <unordered_map>
 #endif
 #if defined(__linux__)
+#include <dlfcn.h>
+#include <map>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 
@@ -39,7 +44,8 @@ const char *const kNames[kLabels] = {
     "other", "EE-code", "events", "kernel", "idle", "IOP-sync", "SIF-pump", "DMA", "IPU", "QUEUE-FULL", "VU-drain", "LIMITER",
     "vu-work", "vu-wait", "render-work", "render-wait", "post-work", "post-wait", "tiles-wait", "PRESENT-WAIT",
     "w:encoder", "w:begin-pass", "w:set-pipeline", "w:set-group", "w:dispatch", "w:end-pass", "w:render-pass", "w:finish", "w:submit",
-    "w:write-buf", "w:poll", "w:ACQUIRE", "w:PRESENT", "w:readback", "w:copy-map", "w:wait-post"};
+    "w:write-buf", "w:poll", "w:ACQUIRE", "w:PRESENT", "w:readback", "w:copy-map", "w:wait-post",
+    "r:gs-cmds", "r:shape", "r:build", "r:schedule", "r:prepare", "r:encode", "r:gpu-prof", "v:vif", "v:program", "v:xgkick"};
 
 struct Slot {
     std::atomic<std::uint8_t> label{0};
@@ -379,6 +385,106 @@ std::atomic<int> g_tids[16];
 std::atomic<int> g_tid_count{0};
 }  // namespace
 
+#if defined(__linux__) && (defined(__aarch64__) || defined(__x86_64__))
+// PS2_PC_SAMPLE=<seconds>: where the processor is, by instruction address (a phone has no perf): a CPU-time timer signals the running threads
+// every millisecond, the handler notes the interrupted instruction's address and thread, and every <seconds> a thread prints, per thread, the dearest
+// addresses as module + offset (the live-compiled vector programs are libraries of the cache: pull one and objdump it at the offset).
+// "[pcs] <thread> <module> +<offset> <samples> <symbol>"; PS2_PC_SAMPLE_TOP=<n> lines per thread (default 80).
+namespace {
+struct PcSample {
+    std::uintptr_t pc;
+    int tid;
+};
+constexpr std::size_t kPcMax = 1u << 21;
+PcSample *g_pc_buf = nullptr;
+std::atomic<std::size_t> g_pc_n{0};
+std::mutex g_pc_names_mutex;
+std::map<int, std::string> g_pc_names;  // thread id -> its name (register_thread)
+
+void pc_handler(int, siginfo_t *, void *context) {
+    const auto *uc = static_cast<const ucontext_t *>(context);
+#if defined(__aarch64__)
+    const std::uintptr_t pc = static_cast<std::uintptr_t>(uc->uc_mcontext.pc);
+#else
+    const std::uintptr_t pc = static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RIP]);
+#endif
+    const std::size_t i = g_pc_n.fetch_add(1, std::memory_order_relaxed);
+    if (i < kPcMax) g_pc_buf[i] = {pc, static_cast<int>(syscall(SYS_gettid))};
+}
+
+void pc_report(unsigned seconds, unsigned top) {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        const std::size_t n = std::min(g_pc_n.exchange(0), kPcMax);
+        std::vector<PcSample> copy(g_pc_buf, g_pc_buf + n);
+        std::map<int, std::map<std::uintptr_t, std::uint32_t>> by_thread;
+        for (const PcSample &s : copy) ++by_thread[s.tid][s.pc];
+        for (const auto &[tid, pcs] : by_thread) {
+            std::uint32_t total = 0;
+            for (const auto &e : pcs) total += e.second;
+            std::string name_text = "?";
+            {
+                std::lock_guard<std::mutex> lock(g_pc_names_mutex);
+                if (const auto it = g_pc_names.find(tid); it != g_pc_names.end()) name_text = it->second;
+            }
+            for (char &c : name_text)
+                if (c == ' ') c = '_';
+            const char *name = name_text.c_str();
+            std::fprintf(stderr, "[pcs] thread %s (tid %d): %u samples in %u s\n", name, tid, total, seconds);
+            std::vector<std::pair<std::uint32_t, std::uintptr_t>> order;
+            for (const auto &e : pcs) order.push_back({e.second, e.first});
+            std::sort(order.rbegin(), order.rend());
+            for (std::size_t k = 0; k < order.size() && k < top; ++k) {
+                Dl_info info{};
+                const bool ok = dladdr(reinterpret_cast<void *>(order[k].second), &info) && info.dli_fname;
+                const char *file = ok ? std::strrchr(info.dli_fname, '/') : nullptr;
+                std::fprintf(stderr, "[pcs] %s %s +%llx %u %s\n", name, ok ? (file ? file + 1 : info.dli_fname) : "?",
+                             static_cast<unsigned long long>(ok ? order[k].second - reinterpret_cast<std::uintptr_t>(info.dli_fbase) : order[k].second), order[k].first,
+                             ok && info.dli_sname ? info.dli_sname : "");
+            }
+        }
+    }
+}
+
+const bool g_pc_sample = [] {
+    const char *v = std::getenv("PS2_PC_SAMPLE");
+    const int seconds = v ? std::atoi(v) : 0;
+    if (seconds <= 0) return false;
+    const char *t = std::getenv("PS2_PC_SAMPLE_TOP");
+    const unsigned top = t && std::atoi(t) > 0 ? static_cast<unsigned>(std::atoi(t)) : 80u;
+    g_pc_buf = new PcSample[kPcMax];
+    struct sigaction sa {};
+    sa.sa_sigaction = pc_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPROF, &sa, nullptr);
+    std::thread(pc_report, static_cast<unsigned>(seconds), top).detach();
+    return true;
+}();
+}  // namespace
+
+// The calling thread's own CPU-time timer (a process-wide one signals whichever thread the kernel picks, and starves the busy ones).
+void pc_thread_timer(const char *name) {
+    if (!g_pc_sample) return;
+    {
+        std::lock_guard<std::mutex> lock(g_pc_names_mutex);
+        g_pc_names[static_cast<int>(syscall(SYS_gettid))] = name ? name : "?";
+    }
+    clockid_t cid;
+    if (pthread_getcpuclockid(pthread_self(), &cid) != 0) return;
+    sigevent sev{};
+    sev.sigev_notify = SIGEV_THREAD_ID;
+    sev.sigev_signo = SIGPROF;
+    sev._sigev_un._tid = static_cast<int>(syscall(SYS_gettid));
+    timer_t timer;
+    if (timer_create(cid, &sev, &timer) != 0) return;
+    itimerspec spec{};
+    spec.it_interval.tv_nsec = 1000000;
+    spec.it_value.tv_nsec = 1000000;
+    timer_settime(timer, 0, &spec, nullptr);
+}
+#endif
+
 int thread_ids(int *out, int max) {
     const int n = std::min(std::min(g_tid_count.load(), 16), max);
     for (int i = 0; i < n; ++i) out[i] = g_tids[i].load();
@@ -389,11 +495,19 @@ void register_thread(const char *name) {
 #if defined(__linux__)
     if (!t_seen) {
         t_seen = true;
+#if defined(__aarch64__) || defined(__x86_64__)
+        pc_thread_timer(name);
+#endif
         // the heavy threads only: the log copy, the watchdog and the sound feeder sleep nearly all the time
         const bool heavy = name && std::strstr(name, "log") == nullptr && std::strstr(name, "watchdog") == nullptr && std::strstr(name, "sound") == nullptr;
         if (heavy) {
             const int i = g_tid_count.fetch_add(1);
             if (i < 16) g_tids[i].store(static_cast<int>(syscall(SYS_gettid)));
+            if (std::getenv("PS2_THREAD_LOG")) {
+                static const auto start = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[threads] #%d \"%s\" tid %ld at +%.1f s\n", i, name ? name : "?", static_cast<long>(syscall(SYS_gettid)),
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+            }
             else g_tid_count.store(16);
         }
     }

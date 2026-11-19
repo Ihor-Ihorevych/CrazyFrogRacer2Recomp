@@ -89,13 +89,31 @@ struct Result {
     bool invalid;
 };
 
+// The quotient of two numbers that are neither zero (after flush): the same bits as from_double(to_double(a) / to_double(b)), worked out on the mantissas
+// with one integer divide. The double route cuts the quotient (to_double's 53-bit rounding never moves it across a 24-bit boundary: the exact quotient of
+// two 24-bit mantissas is either exact or at least 2^-47 away from one), so the result is the exact quotient cut to 24 bits: floor(ma * 2^s / mb) with
+// s = 23 when ma >= mb (the quotient is in [1, 2)) and 24 when it is below 1 (the exponent is one less then). The exponent is the difference, and an
+// exponent of 255 is an ordinary number on both routes. ~12 integer instructions instead of ~35 and a divide that is not a floating-point one.
+inline std::uint32_t div_mantissas(std::uint32_t a, std::uint32_t b) {
+    const std::uint32_t sign = (a ^ b) & kSign;
+    const std::uint32_t ma = mantissa(a), mb = mantissa(b);
+    const bool atleast = ma >= mb;
+    const int e = static_cast<int>(exponent(a)) - static_cast<int>(exponent(b)) + 126 + (atleast ? 1 : 0);
+    const std::uint64_t q = (static_cast<std::uint64_t>(ma) << (atleast ? 23 : 24)) / mb;
+    return pack(sign, e, static_cast<std::uint32_t>(q));
+}
+
 inline Result div(std::uint32_t a, std::uint32_t b) {
     a = flush(a);
     b = flush(b);
     const std::uint32_t sign = (a ^ b) & kSign;
     if (!(b & kAbs)) return {sign | kAbs, true};
     if (!(a & kAbs)) return {sign, false};
+#if defined(__aarch64__)
+    return {div_mantissas(a, b), false};
+#else
     return {from_double(to_double(a) / to_double(b)), false};
+#endif
 }
 
 inline std::uint32_t sqrt(std::uint32_t a) {

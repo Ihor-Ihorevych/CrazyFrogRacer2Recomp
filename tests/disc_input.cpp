@@ -369,6 +369,77 @@ void elf_tests() {
     }
 }
 
+// A raw CD image (2352-byte mode 2 sectors) next to a CUE sheet that names a file with another name: opening the sheet finds the one
+// image in its folder and reads the file system through the 24-byte sector heads; the same image opened directly works too.
+void raw_cd_tests() {
+    const std::size_t S = disc::kSector;
+    auto img = image(20, S);
+    std::size_t at = dots(img, 20 * S, 20, 20);
+    record(img, at, 30, 100, false, "SYSTEM.CNF;1");
+    std::memcpy(img.data() + 30 * S, "BOOT2 = cdrom0:\\RAW;1", 20);
+    std::vector<std::uint8_t> raw(kSectors * 2352u, 0);
+    for (std::uint32_t s = 0; s < kSectors; ++s) {
+        std::uint8_t *sector = raw.data() + static_cast<std::size_t>(s) * 2352u;
+        std::memset(sector + 1, 0xFF, 10);
+        sector[15] = 2;  // mode 2
+        sector[16] = sector[20] = 0;
+        sector[18] = sector[22] = 0x08;  // the form 1 subheader, twice
+        std::memcpy(sector + 24, img.data() + static_cast<std::size_t>(s) * S, S);
+    }
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "ps2disc_raw_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream bin(dir / "game_renamed.bin", std::ios::binary);
+        bin.write(reinterpret_cast<const char *>(raw.data()), static_cast<std::streamsize>(raw.size()));
+        std::ofstream cue(dir / "game.cue");
+        cue << "FILE \"Game (Europe).bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n";
+    }
+    check(disc::open((dir / "game.cue").string()), "raw image: a CUE sheet with a wrong file name opens the one image beside it");
+    const auto cnf = disc::find("cdrom0:\\SYSTEM.CNF;1");
+    check(cnf && cnf->sector == 30 && cnf->size == 100, "raw image: the file system is read through the sector heads");
+    const auto data = iop::kernel::read_disc_file("cdrom0:\\SYSTEM.CNF;1");
+    check(data.size() == 100 && std::memcmp(data.data(), "BOOT2 = cdrom0:\\RAW", 19) == 0, "raw image: a file reads back");
+    check(disc::sector_count() == kSectors, "raw image: the sector count is the 2048-byte one");
+    check(disc::open((dir / "game_renamed.bin").string()) && disc::find("cdrom0:\\SYSTEM.CNF;1").has_value(), "raw image: the BIN opens directly");
+    {   // two images in the folder and a wrong name: nothing to choose from
+        std::ofstream((dir / "other.bin"), std::ios::binary).write("x", 1);
+        check(!disc::open((dir / "game.cue").string()), "raw image: a CUE sheet that cannot be resolved is refused");
+    }
+    std::error_code ec;  // the disc module still holds the last image open (Windows refuses to delete it): left for the next run
+    std::filesystem::remove_all(dir, ec);
+}
+
+// A folder with the files of a disc (SYSTEM.CNF in it, no manifest): the file system is made in memory, so the files are found by name
+// and read back, in sub-folders too, whatever the case of the host's names.
+void plain_folder_tests() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "ps2disc_plain_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir / "bigdata" / "deep", ec);
+    auto write = [](const std::filesystem::path &p, const std::string &text) { std::ofstream(p, std::ios::binary).write(text.data(), static_cast<std::streamsize>(text.size())); };
+    const std::string cnf_text = "BOOT2 = cdrom0:\\SLES_999.99;1\nVER = 1.00\n";
+    write(dir / "system.cnf", cnf_text);
+    write(dir / "SLES_999.99", std::string(5000, 'E'));
+    write(dir / "bigdata" / "data.big", std::string(3 * 2048 + 17, 'B'));
+    write(dir / "bigdata" / "deep" / "x.txt", "deep file");
+    for (int i = 0; i < 80; ++i) write(dir / "bigdata" / ("FILE_WITH_A_LONG_NAME_" + std::to_string(i) + ".DAT"), "d");  // more than one directory sector
+    check(disc::open(dir.string()), "plain folder: a folder with SYSTEM.CNF opens");
+    const auto cnf = disc::find("cdrom0:\\SYSTEM.CNF;1");
+    check(cnf && cnf->size == cnf_text.size(), "plain folder: SYSTEM.CNF is found with its size");
+    const auto elf = disc::find("cdrom0:\\SLES_999.99;1");
+    check(elf && elf->size == 5000, "plain folder: the boot program is found with its size");
+    const auto big = disc::find("cdrom0:\\BIGDATA\\DATA.BIG;1");
+    check(big && big->size == 3 * 2048 + 17, "plain folder: a file in a sub-folder is found");
+    check(disc::find("cdrom0:\\BIGDATA\\DEEP\\X.TXT;1").has_value(), "plain folder: a file two levels down is found");
+    check(disc::find("cdrom0:\\BIGDATA\\FILE_WITH_A_LONG_NAME_79.DAT;1").has_value(), "plain folder: the records of a second directory sector are found");
+    const auto back = iop::kernel::read_disc_file("cdrom0:\\BIGDATA\\DATA.BIG;1");
+    check(back.size() == 3 * 2048 + 17 && back.front() == 'B' && back.back() == 'B', "plain folder: a file reads back whole");
+    const auto program = iop::kernel::read_disc_file("cdrom0:\\SLES_999.99;1");
+    check(program.size() == 5000 && program[4999] == 'E', "plain folder: the boot program reads back");
+    std::filesystem::remove_all(dir, ec);
+}
+
 void disc_folder_tests() {
     const std::size_t S = disc::kSector;
     auto img = image(20, S);
@@ -477,6 +548,8 @@ void disc_bundle_tests() {
 
 int main() {
     disc_tests();
+    raw_cd_tests();
+    plain_folder_tests();
     disc_folder_tests();
     disc_bundle_tests();
     irx_tests();

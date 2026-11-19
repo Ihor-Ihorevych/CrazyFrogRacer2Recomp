@@ -1,4 +1,5 @@
 #include "hw.hpp"
+#include "prov.hpp"
 #include "ipu/ipu.hpp"
 #include "vu_micro.hpp"
 #include "ps2/memory.hpp"
@@ -30,6 +31,14 @@ bool g_watch_on = false;
 std::uint32_t g_watch_base = 0, g_watch_end = 0;
 
 void init_watch() {
+    if (const char *w = std::getenv("PS2_WRITERS"); w && w[0] == '1' && std::getenv("PS2_PROV")) {   // docs/debugging-native.md: every store is looked at
+        g_watch_base = 0;
+        g_watch_end = kRamSize;
+        g_watch_on = true;
+        g_store_ram_end = 0;
+        std::fprintf(stderr, "[watch] PS2_WRITERS: every store is counted against the code that made it (slow)\n");
+        return;
+    }
     if (const char *spec = std::getenv("PS2_WATCH")) {
         std::uint32_t base = 0, len = 0;
         if (std::sscanf(spec, "%x,%x", &base, &len) == 2 && len) {
@@ -43,6 +52,10 @@ void init_watch() {
 }
 
 void watch_hit(std::uint32_t a, std::uint32_t v, const char *via) {
+    if (prov::g_writers) {
+        prov::note_store(a, 4);
+        return;
+    }
     const std::uint8_t *at = (a < kRamSize) ? g_ram + a : ((a >> 14) == (kScratchpadBase >> 14) ? g_spr + (a & (kScratchpadSize - 1)) : nullptr);
     std::uint32_t was = 0;
     if (at) std::memcpy(&was, at, 4);

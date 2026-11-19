@@ -1713,16 +1713,43 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
     plot(s, x, y, k, at);
 }
 
+// One texture level: prm(0) its setup, prm(1) where in `decoded` it goes, prm(2) its texels. With prm(3) = N > 1 it is a batch of N levels that
+// followed each other in the command stream (the textures of a frame, the mip levels of one): prm(2) is the texels of all, prm(4) a table in
+// the arena of N rows { setup, out, texels, first thread } and a thread finds its level by a binary search of the rows.
 @compute @workgroup_size(64)
 fn decode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x + gid.y * 64u * 1024u;
     if (i >= prm(2u)) {
         return;
     }
-    let s = load_setup(prm(0u));
-    let x = i & ((1u << s.tw) - 1u);
-    let y = i >> s.tw;
-    decoded[prm(1u) + i] = convert(s, load_at(addr(s.tf, x, y), 0u));
+    var setup_at = prm(0u);
+    var out_at = prm(1u);
+    var local = i;
+    let jobs = prm(3u);
+    if (jobs > 1u) {
+        let table = prm(4u);
+        var lo = 0u;
+        var hi = jobs - 1u;
+        loop {
+            if (lo >= hi) {
+                break;
+            }
+            let mid = (lo + hi + 1u) / 2u;
+            if (data[table + mid * 4u + 3u] <= i) {
+                lo = mid;
+            } else {
+                hi = mid - 1u;
+            }
+        }
+        let row = table + lo * 4u;
+        setup_at = data[row];
+        out_at = data[row + 1u];
+        local = i - data[row + 3u];
+    }
+    let s = load_setup(setup_at);
+    let x = local & ((1u << s.tw) - 1u);
+    let y = local >> s.tw;
+    decoded[out_at + local] = convert(s, load_at(addr(s.tf, x, y), 0u));
 }
 
 @compute @workgroup_size(64)

@@ -25,5 +25,9 @@ std::uint64_t runaway_kicks();
 void runaway_summary();
 // The GIF tags a kick at `address` walks through, one line each (what the report of the first such packet shows).
 std::string describe_packet(std::uint32_t address);
+// PS2_VU1_WATCH (docs/debugging-vu1.md): the VIF1 looks at the watched quadwords of VU1's data memory before and after an UNPACK.
+bool watching_vu1();
+void watch_vu1_snapshot();
+void watch_vu1_report(const char *who, std::uint32_t cmd, std::uint32_t num, std::uint32_t a, std::uint32_t b);
 
 }

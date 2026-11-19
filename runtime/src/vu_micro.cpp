@@ -4,6 +4,7 @@
 #include "gs/gif.hpp"
 #include "gs/queue.hpp"
 #include "vif.hpp"
+#include "prov.hpp"
 #include "vu_jit_web.hpp"
 #include "hw.hpp"
 #include "ps2/fpu.hpp"
@@ -81,6 +82,7 @@ void read_q(const Unit &u, vuops::FlagPipe &pipe, Vu0Regs &r, std::uint32_t pc, 
 
 std::uint64_t g_reported = 0;
 bool g_reference_dry = false;
+std::vector<std::uint64_t> *g_kick_record = nullptr;  // PS2_VU_SPIKE: while set, XGKICK packets are hashed into this list instead of being sent
 
 Unit unit_of(int n) {
     if (n == 0) return Unit{&g_cpu.vu0, g_vu0_code, g_vu0_mem, 4095u, 256u, g_cpu.vu0.tpc};
@@ -507,10 +509,147 @@ __attribute__((noinline)) void xgkick_wrapped(Unit &u, std::uint32_t first, std:
     gif::transfer(1, buffer, count);
 }
 
+// ---- debugging of VU1 (docs/debugging-vu1.md) -------------------------------------------------------------------------------------
+// PS2_VU1_KICKLOG=<n>   one line for each of the first n XGKICKs (empty or 0: off): number, run number, program entry and key, kick
+//                       address, TOP and ITOP, the first GIF tag, the packet length the kick measured and whether it was cut.
+// PS2_VU1_DUMP=<dir>[,<n>]  the full state of unit 1 (vector and integer registers, Q P I R, flags, VIF TOP/ITOP, the 16 KiB data memory
+//                       as words and floats, the 16 KiB of micro code as words) into <dir>/vu1_runaway_<k>.txt, for the first n (default
+//                       3) XGKICK packets that do not end, and into <dir>/vu1_run_<number>.txt after the run PS2_VU1_DUMP_RUN names.
+// PS2_VU1_TRACE=<run>[,<count>]  every instruction of VU1 program runs <run> .. <run>+<count>-1 (runs numbered from 1 since the start,
+//                       default count 1): pc, both instruction words, the register the upper instruction wrote (name, mask, value as
+//                       floats and words), the integer registers that changed, MAC/status/clip, and the Q register. A run is one entry
+//                       of a program, from the MSCAL (or MSCNT, or the next part of a chain) to its end.
+std::uint64_t g_vu1_run_number = 0;
+
+struct Vu1Debug {
+    std::uint64_t trace_first = 0, trace_count = 0, dump_run = 0, kick_log = 0, dump_runaways = 3;
+    std::string dump_dir;
+    Vu1Debug() {
+        if (const char *t = std::getenv("PS2_VU1_TRACE")) {
+            char *end = nullptr;
+            trace_first = std::strtoull(t, &end, 10);
+            trace_count = end && *end == ',' ? std::strtoull(end + 1, nullptr, 10) : 1;
+        }
+        if (const char *k = std::getenv("PS2_VU1_KICKLOG")) kick_log = std::strtoull(k, nullptr, 10);
+        if (const char *d = std::getenv("PS2_VU1_DUMP"); d && *d) {
+            const std::string text = d;
+            const std::size_t comma = text.rfind(',');
+            if (comma != std::string::npos && comma + 1 < text.size() && std::isdigit(static_cast<unsigned char>(text[comma + 1]))) {
+                dump_dir = text.substr(0, comma);
+                dump_runaways = std::strtoull(text.c_str() + comma + 1, nullptr, 10);
+            } else {
+                dump_dir = text;
+            }
+        }
+        if (const char *r = std::getenv("PS2_VU1_DUMP_RUN")) dump_run = std::strtoull(r, nullptr, 10);
+    }
+    bool tracing(std::uint64_t run) const { return trace_first && run >= trace_first && run < trace_first + trace_count; }
+};
+const Vu1Debug &vu1_debug() {
+    static const Vu1Debug d;
+    return d;
+}
+
+// The whole state of unit 1 as text: what is needed to run the program again by hand and to see what it was given.
+void dump_vu1_state(const std::string &path, const char *why) {
+    std::FILE *f = std::fopen(path.c_str(), "w");
+    if (!f) {
+        std::fprintf(stderr, "[vu1-dump] cannot write %s\n", path.c_str());
+        return;
+    }
+    std::uint32_t entry = 0;
+    std::uint64_t key = 0;
+    bool compiled = false;
+    current_program(entry, key, compiled);
+    std::fprintf(f, "# %s\n# run %llu, program entry 0x%04X key %016llX (%s), VIF TOP %u ITOP %u, tpc 0x%04X\n", why, static_cast<unsigned long long>(g_vu1_run_number), entry,
+                 static_cast<unsigned long long>(key), compiled ? "compiled" : "interpreted", g_top, g_itop, g_vu1.tpc);
+    for (int i = 0; i < 32; ++i) {
+        float v[4];
+        std::uint32_t w[4];
+        std::memcpy(v, &g_vu1.vf[i], 16);
+        std::memcpy(w, &g_vu1.vf[i], 16);
+        std::fprintf(f, "vf%02d %08X %08X %08X %08X | %g %g %g %g\n", i, w[0], w[1], w[2], w[3], v[0], v[1], v[2], v[3]);
+    }
+    for (int i = 0; i < 16; ++i) std::fprintf(f, "vi%02d %04X (%u)\n", i, g_vu1.vi[i], g_vu1.vi[i]);
+    std::fprintf(f, "q %08X p %08X i %08X r %08X mac %08X status %08X clip %08X\n", g_vu1.q, g_vu1.p, g_vu1.i, g_vu1.r, g_vu1.mac, g_vu1.status, g_vu1.clip);
+    for (int qw = 0; qw < 1024; ++qw) {
+        float v[4];
+        std::uint32_t w[4];
+        std::memcpy(v, g_vu1_mem + qw * 16, 16);
+        std::memcpy(w, g_vu1_mem + qw * 16, 16);
+        std::fprintf(f, "m%03X %08X %08X %08X %08X | %g %g %g %g\n", qw, w[0], w[1], w[2], w[3], v[0], v[1], v[2], v[3]);
+    }
+    for (int pc = 0; pc < 16384; pc += 8) {
+        std::uint32_t lo, hi;
+        std::memcpy(&lo, g_vu1_code + pc, 4);
+        std::memcpy(&hi, g_vu1_code + pc + 4, 4);
+        std::fprintf(f, "c%04X %08X %08X\n", pc, hi, lo);
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "[vu1-dump] wrote %s (%s)\n", path.c_str(), why);
+}
+
+// One executed instruction pair of a traced run, after it ran.
+void trace_vu1_step(std::uint64_t run, std::uint32_t steps, std::uint32_t pc, std::uint32_t lo, std::uint32_t hi, const Vu0Regs &r, int target, const Reg128 &value, unsigned dest,
+                    const std::uint16_t (&was)[16]) {
+    std::fprintf(stderr, "[vu1-t] run %llu #%u pc %04X hi %08X lo %08X", static_cast<unsigned long long>(run), steps, pc, hi, lo);
+    if (target > 0 || target == 32) {
+        float v[4];
+        std::memcpy(v, &value, 16);
+        std::fprintf(stderr, " | %s%d.%s%s%s%s = %g %g %g %g (%08X %08X %08X %08X)", target == 32 ? "ACC" : "vf", target == 32 ? 0 : target, dest & 8 ? "x" : "", dest & 4 ? "y" : "",
+                     dest & 2 ? "z" : "", dest & 1 ? "w" : "", v[0], v[1], v[2], v[3], value.w[0], value.w[1], value.w[2], value.w[3]);
+    }
+    for (int i = 1; i < 16; ++i)
+        if (was[i] != r.vi[i]) std::fprintf(stderr, " | vi%d %04X->%04X", i, was[i], r.vi[i]);
+    std::fprintf(stderr, " | mac %X st %X clip %X q %08X\n", r.mac, r.status, r.clip, r.q);
+}
+
+// PS2_VU1_WATCH=<qword>[,<qword>...] (hex, up to 8 quadword indices of VU1's data memory): a line whenever one of them changes, and who changed
+// it: a VU1 instruction (run, step, pc, both words) or a VIF1 UNPACK (its command word), with the old and new words and floats. Together
+// with PS2_VU1_TRACE this answers "who wrote this word".
+struct WatchSet {
+    std::uint32_t n = 0, q[8] = {};
+    WatchSet() {
+        const char *w = std::getenv("PS2_VU1_WATCH");
+        while (w && *w && n < 8) {
+            char *end = nullptr;
+            q[n++] = static_cast<std::uint32_t>(std::strtoul(w, &end, 16)) & 1023u;
+            w = end && *end == ',' ? end + 1 : nullptr;
+        }
+    }
+};
+const WatchSet &watch_set() {
+    static const WatchSet w;
+    return w;
+}
+std::uint8_t g_watch_before[8][16];
+
+void watch_snapshot() {
+    const WatchSet &w = watch_set();
+    for (std::uint32_t i = 0; i < w.n; ++i) std::memcpy(g_watch_before[i], g_vu1_mem + w.q[i] * 16, 16);
+}
+
+void watch_report(const char *who, std::uint64_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+    const WatchSet &w = watch_set();
+    for (std::uint32_t i = 0; i < w.n; ++i) {
+        const std::uint8_t *now = g_vu1_mem + w.q[i] * 16;
+        if (std::memcmp(g_watch_before[i], now, 16) == 0) continue;
+        std::uint32_t o[4], nw[4];
+        float of[4], nf[4];
+        std::memcpy(o, g_watch_before[i], 16);
+        std::memcpy(nw, now, 16);
+        std::memcpy(of, o, 16);
+        std::memcpy(nf, nw, 16);
+        std::fprintf(stderr, "[vu1-w] m%03X by %s %llu %X %X %X: %08X %08X %08X %08X (%g %g %g %g) -> %08X %08X %08X %08X (%g %g %g %g)\n", w.q[i], who, static_cast<unsigned long long>(a), b, c, d, o[0], o[1],
+                     o[2], o[3], of[0], of[1], of[2], of[3], nw[0], nw[1], nw[2], nw[3], nf[0], nf[1], nf[2], nf[3]);
+        std::memcpy(g_watch_before[i], now, 16);
+    }
+}
+
 // The packet is only measured here (one 8-byte read per GIF tag); the bytes are handed over where they lie in the data memory,
 // which gif::transfer copies before it returns, so nothing is copied twice and no 16 KiB buffer is set up for each kick.
-void xgkick(Unit &u, std::uint32_t address) {
-    if (g_reference_dry) return;
+void xgkick_now(Unit &u, std::uint32_t address) {
+    const prof::Scope kick_scope(prof::kVKick);
     const std::uint32_t qwords = u.data_qwords, first = address & (qwords - 1);
     std::uint32_t q = first, count = 0;
     bool done = false, cut = false;
@@ -536,7 +675,28 @@ void xgkick(Unit &u, std::uint32_t address) {
         count += body;
         done = eop;
     }
+    if (g_kick_record) {  // PS2_VU_SPIKE's probe runs: the packet is only hashed (address, length and bytes), nothing is sent
+        std::uint64_t h = 1469598103934665603ull ^ first ^ (static_cast<std::uint64_t>(count) << 20);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const std::uint8_t *p = qword(u, first + i);
+            for (int k = 0; k < 16; ++k) h = (h ^ p[k]) * 1099511628211ull;
+        }
+        g_kick_record->push_back(h);
+        return;
+    }
     g_kicks[g_kick_count++ & 7u] = KickNote{first, count, g_trace_vu1_pc & 16383u, cut || !done};
+    if (const Vu1Debug &dbg = vu1_debug(); dbg.kick_log && g_kick_count <= dbg.kick_log) {
+        std::uint32_t entry = 0;
+        std::uint64_t key = 0;
+        bool compiled = false;
+        current_program(entry, key, compiled);
+        std::uint64_t t0 = 0, t1 = 0;
+        std::memcpy(&t0, qword(u, first), 8);
+        std::memcpy(&t1, qword(u, first) + 8, 8);
+        std::fprintf(stderr, "[vu1-kick] #%u run %llu entry 0x%04X key %016llX (%s) addr 0x%03X TOP %u ITOP %u tag %016llX %016llX: %u qwords%s\n", g_kick_count,
+                     static_cast<unsigned long long>(g_vu1_run_number), entry, static_cast<unsigned long long>(key), compiled ? "compiled" : "interpreted", first, g_top, g_itop,
+                     static_cast<unsigned long long>(t1), static_cast<unsigned long long>(t0), count, cut || !done ? " CUT (no end)" : "");
+    }
     if (count) {
         if (first + count <= qwords) gif::transfer(1, u.data + first * 16, count);
         else xgkick_wrapped(u, first, count);
@@ -544,9 +704,58 @@ void xgkick(Unit &u, std::uint32_t address) {
     // More than the whole memory is never a real packet: the GIF met a "tag" that is not one. The packet ends with this kick, as the
     // console's next XGKICK starts a packet of its own (gif::end_runaway_kick).
     if (cut || !done) [[unlikely]] {
+        if (const Vu1Debug &dbg = vu1_debug(); !dbg.dump_dir.empty() && g_runaway_total < dbg.dump_runaways)
+            dump_vu1_state(dbg.dump_dir + "/vu1_runaway_" + std::to_string(g_runaway_total + 1) + ".txt", "an XGKICK packet that does not end (dumped as it is kicked)");
         note_runaway(first);
         gif::end_runaway_kick(first);
     }
+}
+
+// XGKICK does not read its packet at once. The GIF starts about one instruction later, so a store in the instruction pair right after the
+// kick still makes it into the packet, and the programs of Electronic Arts' games rely on that: Harry Potter 2's vertex program kicks
+// the packet it built with `XGKICK vi6` and writes the first word of its GIF tag (NLOOP, EOP: `ISW.x vi13, 0(vi6)`) in the next pair.
+// Read at the kick, the tag was the vertex x that lay there, the packet measured as thousands of qwords, and the GIF sprayed the picture
+// with random primitives. So a kick waits for one pair: the interpreter calls kick_step() after each pair, a compiled program says
+// vu::kick(1, kFlushKick) after the pair that follows a kick (vurecomp_gen.cpp), and a program that ends sends it at once.
+// PS2_VU1_KICK_DELAY=0 sends at the kick (the old behaviour) to compare.
+struct PendingKick {
+    bool on = false;
+    std::uint32_t address = 0;
+    int delay = 0;
+};
+PendingKick g_pending_kick;
+constexpr std::uint32_t kFlushKick = 0xFFFFu;  // vu::kick(1, kFlushKick) from compiled code: the pair after a kick is done
+
+bool kick_delay_enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("PS2_VU1_KICK_DELAY");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+void kick_flush() {
+    if (!g_pending_kick.on) return;
+    g_pending_kick.on = false;
+    Unit u = unit_of(1);
+    xgkick_now(u, g_pending_kick.address);
+}
+
+// After each pair of the interpreter: the kick of the pair before this one goes out now.
+inline void kick_step() {
+    if (g_pending_kick.on && g_pending_kick.delay-- == 0) kick_flush();
+}
+
+void xgkick(Unit &u, std::uint32_t address) {
+    if (g_reference_dry) return;
+    if (!kick_delay_enabled() || u.code != g_vu1_code) {
+        xgkick_now(u, address);
+        return;
+    }
+    kick_flush();  // a second kick while one waits: the first goes out first
+    g_pending_kick.on = true;
+    g_pending_kick.address = address;
+    g_pending_kick.delay = 1;
 }
 
 // A VU branch that reads an integer register the instruction right before it
@@ -1013,6 +1222,10 @@ void install_live() {
 }
 
 void kick(int unit, std::uint32_t address) {
+    if (unit == 1 && address == kFlushKick) {  // not a kick: the pair after one is done (compiled programs, see xgkick)
+        kick_flush();
+        return;
+    }
     if (g_kick_log && unit == 1) g_kick_log->push_back(address);
     Unit u = unit_of(unit);
     xgkick(u, address);
@@ -1127,7 +1340,24 @@ bool g_chaining = false;
 std::int64_t g_chained = -1;
 std::uint64_t g_last_key = 0;
 
+__attribute__((noinline)) void interpret_full(int unit, std::uint32_t pc);
+namespace {
+void spike_chain(std::uint32_t pc, std::uint32_t every);  // PS2_VU_SPIKE (below)
+bool g_spike_probing = false, g_spike_real = false;
+}
+
+// Every compiled VU1 program ends here when it hands over to the next one (~100 000 times a frame): while the chain loop below is running (g_chaining), that
+// only notes where to go on. This much is a few instructions without a stack frame; the rest (the loop, the first call of a chain, VU0, the capture of
+// a test) is interpret_full, with its ten saved registers and stack check.
 void interpret(int unit, std::uint32_t pc) {
+    if (unit == 1 && g_chaining && !g_capture) [[likely]] {
+        g_chained = pc;
+        return;
+    }
+    interpret_full(unit, pc);
+}
+
+void interpret_full(int unit, std::uint32_t pc) {
     if (unit == 1 && g_capture) {
         *g_capture = pc;
         return;
@@ -1140,18 +1370,28 @@ void interpret(int unit, std::uint32_t pc) {
         g_chained = pc;
         return;
     }
+    static const std::uint32_t spike = [] {  // PS2_VU_SPIKE=<n>: every n-th run is probed (see spike_chain)
+        const char *v = std::getenv("PS2_VU_SPIKE");
+        return v ? static_cast<std::uint32_t>(std::max(1, std::atoi(v))) : 0u;
+    }();
+    if (spike && !g_spike_probing && !g_spike_real) {
+        spike_chain(pc, spike);
+        return;
+    }
     g_chaining = true;
     // The plain case (no checking, timing, counting or tracing switch, no JIT) goes straight to the program the entry cache already knows:
     // what run_entry and lookup would do for it, without their set-up. Anything else (a new program, a changed code memory, a program
     // that is not compiled) takes the long way.
     static const bool plain = std::getenv("PS2_VU_INTERPRET") == nullptr && std::getenv("PS2_VU_COUNT") == nullptr && std::getenv("PS2_VU_CHECK") == nullptr &&
-                              std::getenv("PS2_VU_TIME") == nullptr && std::getenv("PS2_TRACE_VU1RUN") == nullptr && jit::mode() == 0;
+                              std::getenv("PS2_VU_TIME") == nullptr && std::getenv("PS2_TRACE_VU1RUN") == nullptr && std::getenv("PS2_VU_SPIKE") == nullptr && jit::mode() == 0;
     for (;;) {
         if (plain && !live::ready()) {
             const EntryCache &e = g_entries[(pc & 16383u) >> 3];
             if (e.generation == g_generation[1] && e.function) {
                 g_trace_vu1_pc = pc;
                 g_vu1_entry = pc & 16383u;
+                if (prov::g_on) prov::vu_run(pc & 16383u, e.key);
+                const prof::Scope prog_scope(prof::kVProg);
                 e.function(g_vu1, g_vu1_mem);
             } else {
                 run_entry(1, pc);
@@ -1160,10 +1400,32 @@ void interpret(int unit, std::uint32_t pc) {
             run_entry(1, pc);
         }
         if (g_chained < 0) break;
+        {   // PS2_VU_CHAIN=1: which program hands over to which (entry addresses), counted and printed at the end of the run
+            static const bool chain_log = std::getenv("PS2_VU_CHAIN") != nullptr;
+            if (chain_log) {
+                static std::unordered_map<std::uint64_t, std::uint64_t> hops;
+                static bool registered = false;
+                if (!registered) {
+                    registered = true;
+                    std::atexit([] {
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> v(hops.begin(), hops.end());
+                        std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+                        std::uint64_t total = 0;
+                        for (const auto &e : v) total += e.second;
+                        std::fprintf(stderr, "[vu-chain] %llu hops between programs:\n", static_cast<unsigned long long>(total));
+                        for (std::size_t i = 0; i < v.size() && i < 24; ++i)
+                            std::fprintf(stderr, "[vu-chain]   %04X -> %04X  %llu (%.1f %%)\n", static_cast<unsigned>(v[i].first >> 16), static_cast<unsigned>(v[i].first & 0xFFFFu),
+                                         static_cast<unsigned long long>(v[i].second), 100.0 * static_cast<double>(v[i].second) / static_cast<double>(std::max<std::uint64_t>(1, total)));
+                    });
+                }
+                ++hops[(static_cast<std::uint64_t>(pc & 16383u) << 16) | (static_cast<std::uint64_t>(g_chained) & 0xFFFFu)];
+            }
+        }
         pc = static_cast<std::uint32_t>(g_chained);
         g_chained = -1;
     }
     g_chaining = false;
+    kick_flush();  // a program ended with a kick waiting (compiled ones end with theirs; the pair after it may not have been reached)
 }
 
 // PS2_VU_TIME=1: the time stamp counter ticks spent in each compiled vector program, printed when the runner ends (a headless
@@ -1217,12 +1479,45 @@ void time_report() {
                      static_cast<unsigned long long>(sorted[i].second.ticks / std::max<std::uint64_t>(1, sorted[i].second.calls)));
 }
 
+// PS2_VU_TIME_EVERY=<seconds>: the same list every <seconds> of play (in milliseconds per second of play, and per call), then counted again from
+// zero. The phone's game never ends the normal way (the app is stopped), so the report at exit never comes there.
+void time_interval_report(double seconds) {
+    std::uint64_t calls = 0, ticks = 0;
+    std::vector<std::pair<std::uint64_t, TimeRow>> sorted(time_rows().begin(), time_rows().end());
+    for (const auto &[k, row] : sorted) {
+        calls += row.calls;
+        ticks += row.ticks;
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.second.ticks > b.second.ticks; });
+    // ticks are the time stamp counter on x86 and nanoseconds elsewhere: the ratio to wall time is measured over the interval
+    const double stamp_per_s = static_cast<double>(time_stamp() - time_first_stamp()) / seconds;
+    std::fprintf(stderr, "[vu-time] %.1f s: %llu programs started, %.1f ms of compiled program time per second of play (%.1f %% of one thread)\n", seconds, static_cast<unsigned long long>(calls),
+                 stamp_per_s > 0 ? static_cast<double>(ticks) / stamp_per_s * 1000.0 / seconds : 0.0, stamp_per_s > 0 ? static_cast<double>(ticks) / stamp_per_s / seconds * 100.0 : 0.0);
+    for (std::size_t i = 0; i < sorted.size() && i < 14; ++i) {
+        const double ms_per_s = stamp_per_s > 0 ? static_cast<double>(sorted[i].second.ticks) / stamp_per_s * 1000.0 / seconds : 0.0;
+        const double us_per_call = stamp_per_s > 0 ? static_cast<double>(sorted[i].second.ticks) / static_cast<double>(std::max<std::uint64_t>(1, sorted[i].second.calls)) / stamp_per_s * 1e6 : 0.0;
+        std::fprintf(stderr, "[vu-time]   %7.1f ms/s  %8.1f calls/s  %7.2f us/call  program %016llX\n", ms_per_s, static_cast<double>(sorted[i].second.calls) / seconds, us_per_call,
+                     static_cast<unsigned long long>(sorted[i].first));
+    }
+    time_rows().clear();
+    time_start() = std::chrono::steady_clock::now();
+    time_first_stamp() = time_stamp();
+}
+
 void time_note(std::uint64_t key, std::uint64_t ticks) {
     static const bool registered = (std::atexit(time_report), time_start() = std::chrono::steady_clock::now(), time_first_stamp() = time_stamp(), true);
     (void)registered;
     TimeRow &row = time_rows()[key];
     ++row.calls;
     row.ticks += ticks;
+    static const double every = [] {
+        const char *v = std::getenv("PS2_VU_TIME_EVERY");
+        return v ? std::atof(v) : 0.0;
+    }();
+    if (every > 0) {
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - time_start()).count();
+        if (seconds >= every) time_interval_report(seconds);
+    }
 }
 
 namespace {
@@ -1252,10 +1547,224 @@ void prof_register_once() {
     ps2::prof::add_counter("vu1 interpreted calls", &g_prof_interpreted.calls, 1.0);
     ps2::prof::add_counter("vu1 interpreted ms", &g_prof_interpreted.ns, 1e-6);
 }
+
+// PS2_VU_SPIKE=<n> (a measuring aid for running VU1 programs on several threads): every n-th compiled program call is run again from the same state with
+// something taken away, and what the program makes (the packets it kicks, the data memory, where it goes on) is compared with a run from the true state:
+//   vf / vi / special: the registers (vf1..31, vi1..15, ACC Q P I R and the flags) start as junk - a difference means the program reads what an earlier
+//                      program left in them;
+//   mem:               the quadwords the previous program call wrote start as junk - a difference means it reads what that call made (through memory).
+// The probes run with kicks only hashed (g_kick_record). The call itself then runs as usual. At the end a table per program: calls, how many of the probes
+// differed, and how many quadwords the calls wrote.
+struct SpikeRow {
+    std::uint64_t calls = 0, vf = 0, vi = 0, special = 0, mem = 0, wrote = 0, written_qwords = 0, max_written = 0;
+    std::uint32_t vf_mask = 0, vi_mask = 0;  // the registers that, taken alone as junk, changed what a run made (vf0 is the constant one)
+    std::uint32_t vf_written = 0, vi_written = 0;  // registers a run left different from how it found them
+};
+std::unordered_map<std::uint64_t, SpikeRow> g_spike_rows;
+bool g_spike_prev_written[1024] = {};
+std::uint64_t g_spike_rng = 88172645463325252ull;
+std::uint32_t spike_rnd() {
+    g_spike_rng ^= g_spike_rng << 13;
+    g_spike_rng ^= g_spike_rng >> 7;
+    g_spike_rng ^= g_spike_rng << 17;
+    return static_cast<std::uint32_t>(g_spike_rng >> 11);
+}
+
+void spike_report() {
+    std::vector<std::pair<std::uint64_t, SpikeRow>> rows(g_spike_rows.begin(), g_spike_rows.end());
+    std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second.calls > b.second.calls; });
+    std::fprintf(stderr, "[vu-spike] MSCAL runs (a chain of programs) probed per first program; probes that differed with vf / vi / acc,q,p,i,r,flags as junk and with the memory the run before wrote as junk; "
+                         "registers that mattered alone (masks) and registers runs changed; runs that wrote memory, average and largest quadwords written\n");
+    for (std::size_t i = 0; i < rows.size() && i < 40; ++i) {
+        const SpikeRow &r = rows[i].second;
+        std::fprintf(stderr, "[vu-spike] %016llX runs %llu  vf %llu vi %llu special %llu mem %llu  needs vf %08X vi %04X  changes vf %08X vi %04X  wrote %llu avg %.1f max %llu\n",
+                     static_cast<unsigned long long>(rows[i].first), static_cast<unsigned long long>(r.calls), static_cast<unsigned long long>(r.vf), static_cast<unsigned long long>(r.vi),
+                     static_cast<unsigned long long>(r.special), static_cast<unsigned long long>(r.mem), r.vf_mask, r.vi_mask, r.vf_written, r.vi_written, static_cast<unsigned long long>(r.wrote),
+                     r.calls ? static_cast<double>(r.written_qwords) / static_cast<double>(r.calls) : 0.0, static_cast<unsigned long long>(r.max_written));
+    }
+}
+
+struct SpikeProbe {
+    std::vector<std::uint64_t> kicks;
+    std::int64_t hop = -1;
+    std::uint8_t mem[16384];
+};
+
+// A whole run (the chain of programs one MSCAL starts) from this state: the interpret loop itself, with kicks only hashed.
+void spike_probe(std::uint32_t pc, const Vu0Regs &regs, const std::uint8_t *mem, SpikeProbe &out) {
+    g_vu1 = regs;
+    std::memcpy(g_vu1_mem, mem, 16384);
+    g_pending_kick = PendingKick{};
+    g_chained = -1;
+    out.kicks.clear();
+    g_kick_record = &out.kicks;
+    g_spike_probing = true;
+    interpret_full(1, pc);
+    kick_flush();
+    g_spike_probing = false;
+    g_kick_record = nullptr;
+    out.hop = -1;
+    std::memcpy(out.mem, g_vu1_mem, 16384);
+}
+
+void spike_chain(std::uint32_t pc, std::uint32_t every) {
+    static std::uint64_t counter = 0;
+    static SpikeProbe base, probe;
+    static std::uint8_t m0[16384], junk_mem[16384];
+    static const bool registered = [] {
+        std::atexit(spike_report);
+        return true;
+    }();
+    (void)registered;
+    ProgramFn first = lookup(pc);
+    (void)first;
+    std::uint64_t key = g_entries[(pc & 16383u) >> 3].key;
+    if (!key) key = pc;
+    static const bool trace = std::getenv("PS2_VU_SPIKE_TRACE") != nullptr;  // consecutive runs: what the carried registers and quadwords hold at the start
+    if (trace) {
+        static std::uint64_t seen = 0;
+        if (++seen > 3000 && seen <= 3040) {
+            std::fprintf(stderr, "[vu-trace] run %llu entry %04X:", static_cast<unsigned long long>(seen), pc & 16383u);
+            for (const int r : {14, 16, 21, 23, 27, 28, 29}) std::fprintf(stderr, " vf%d=%08X,%08X,%08X,%08X", r, g_vu1.vf[r].w[0], g_vu1.vf[r].w[1], g_vu1.vf[r].w[2], g_vu1.vf[r].w[3]);
+            for (const int q : {5, 15, 16}) {
+                std::uint32_t w[4];
+                std::memcpy(w, g_vu1_mem + q * 16, 16);
+                std::fprintf(stderr, " q%d=%08X,%08X,%08X,%08X", q, w[0], w[1], w[2], w[3]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        g_spike_real = true;
+        interpret_full(1, pc);
+        g_spike_real = false;
+        return;
+    }
+    SpikeRow &row = g_spike_rows[key];
+    const Vu0Regs before = g_vu1;
+    std::memcpy(m0, g_vu1_mem, 16384);
+    const PendingKick pending = g_pending_kick;
+    const bool bool_probe = every <= 1 || ++counter % every == 0;
+    if (bool_probe) {
+        ++row.calls;
+        spike_probe(pc, before, m0, base);
+        const auto same_out = [&](const SpikeProbe &p) { return p.kicks == base.kicks && std::memcmp(p.mem, base.mem, 16384) == 0; };
+        Vu0Regs scrambled = before;
+        for (int i = 1; i < 32; ++i)
+            for (int k = 0; k < 4; ++k) scrambled.vf[i].w[k] = spike_rnd();
+        spike_probe(pc, scrambled, m0, probe);
+        const bool vf_differs = !same_out(probe);
+        if (vf_differs) {
+            ++row.vf;
+            for (int i = 1; i < 32; ++i) {  // which one registers alone make the difference
+                scrambled = before;
+                for (int k = 0; k < 4; ++k) scrambled.vf[i].w[k] = spike_rnd();
+                spike_probe(pc, scrambled, m0, probe);
+                if (!same_out(probe)) row.vf_mask |= 1u << i;
+            }
+        }
+        scrambled = before;
+        for (int i = 1; i < 16; ++i) scrambled.vi[i] ^= static_cast<std::uint16_t>(1u + spike_rnd() % 6u);  // a few low bits only: a loop counter must still end
+        spike_probe(pc, scrambled, m0, probe);
+        const bool vi_differs = !same_out(probe);
+        if (vi_differs) {
+            ++row.vi;
+            for (int i = 1; i < 16; ++i) {
+                scrambled = before;
+                scrambled.vi[i] ^= static_cast<std::uint16_t>(1u + spike_rnd() % 6u);
+                spike_probe(pc, scrambled, m0, probe);
+                if (!same_out(probe)) row.vi_mask |= 1u << i;
+            }
+        }
+        scrambled = before;
+        for (int k = 0; k < 4; ++k) scrambled.acc.w[k] = spike_rnd();
+        scrambled.q = spike_rnd();
+        scrambled.p = spike_rnd();
+        scrambled.i = spike_rnd();
+        scrambled.r = spike_rnd() & 0x7FFFFFu;
+        scrambled.mac = spike_rnd() & 0xFFFFu;
+        scrambled.status = spike_rnd() & 0xFFFu;
+        scrambled.clip = spike_rnd() & 0xFFFFFFu;
+        spike_probe(pc, scrambled, m0, probe);
+        if (!same_out(probe)) ++row.special;
+        // memory the call before wrote starts as junk; a quadword that still holds the junk afterwards was not written by this run, and then the
+        // true run must not have written it either
+        std::memcpy(junk_mem, m0, 16384);
+        bool any_prev = false;
+        for (int q = 0; q < 1024; ++q)
+            if (g_spike_prev_written[q]) {
+                any_prev = true;
+                for (int k = 0; k < 4; ++k) {
+                    const std::uint32_t v = spike_rnd();
+                    std::memcpy(junk_mem + q * 16 + k * 4, &v, 4);
+                }
+            }
+        if (any_prev) {
+            spike_probe(pc, before, junk_mem, probe);
+            bool differs = probe.kicks != base.kicks;
+            for (int q = 0; q < 1024 && !differs; ++q) {
+                const bool untouched = g_spike_prev_written[q] && std::memcmp(probe.mem + q * 16, junk_mem + q * 16, 16) == 0;
+                if (untouched) differs = std::memcmp(base.mem + q * 16, m0 + q * 16, 16) != 0;  // the true run wrote it, the junk run did not
+                else differs = std::memcmp(probe.mem + q * 16, base.mem + q * 16, 16) != 0;
+            }
+            if (differs) {
+                ++row.mem;
+                static std::uint64_t attributed = 0;
+                if (attributed < 6) {  // which single quadwords of what the run before wrote matter: the first few differing runs
+                    ++attributed;
+                    std::fprintf(stderr, "[vu-spike-mem] run before wrote %d qwords; the ones that matter alone:", static_cast<int>(std::count(g_spike_prev_written, g_spike_prev_written + 1024, true)));
+                    int matters = 0;
+                    for (int q = 0; q < 1024; ++q) {
+                        if (!g_spike_prev_written[q]) continue;
+                        std::memcpy(junk_mem, m0, 16384);
+                        for (int k = 0; k < 4; ++k) {
+                            const std::uint32_t v = spike_rnd();
+                            std::memcpy(junk_mem + q * 16 + k * 4, &v, 4);
+                        }
+                        spike_probe(pc, before, junk_mem, probe);
+                        bool d = probe.kicks != base.kicks;
+                        for (int p = 0; p < 1024 && !d; ++p) {
+                            const bool untouched = p == q && std::memcmp(probe.mem + p * 16, junk_mem + p * 16, 16) == 0;
+                            d = untouched ? std::memcmp(base.mem + p * 16, m0 + p * 16, 16) != 0 : std::memcmp(probe.mem + p * 16, base.mem + p * 16, 16) != 0;
+                        }
+                        if (d) {
+                            std::fprintf(stderr, " %d", q);
+                            ++matters;
+                        }
+                    }
+                    std::fprintf(stderr, "  (%d)\n", matters);
+                }
+            }
+        }
+    }
+    g_vu1 = before;
+    std::memcpy(g_vu1_mem, m0, 16384);
+    g_pending_kick = pending;
+    g_chained = -1;
+    // the run itself
+    g_spike_real = true;
+    interpret_full(1, pc);
+    g_spike_real = false;
+    std::uint64_t written = 0;
+    for (int q = 0; q < 1024; ++q) {
+        g_spike_prev_written[q] = std::memcmp(g_vu1_mem + q * 16, m0 + q * 16, 16) != 0;
+        written += g_spike_prev_written[q] ? 1 : 0;
+    }
+    if (bool_probe) {
+        static std::uint64_t probed = 0;
+        if (++probed % 40 == 0) spike_report();
+        row.wrote += written ? 1 : 0;
+        row.written_qwords += written;
+        row.max_written = std::max(row.max_written, written);
+        for (int i = 1; i < 32; ++i)
+            if (std::memcmp(&g_vu1.vf[i], &before.vf[i], 16) != 0) row.vf_written |= 1u << i;
+        for (int i = 1; i < 16; ++i)
+            if (g_vu1.vi[i] != before.vi[i]) row.vi_written |= 1u << i;
+    }
+}
 }  // namespace
 
 void run_entry(int unit, std::uint32_t pc) {
     if (unit == 1) g_trace_vu1_pc = pc;
+    if (unit == 1 && prov::g_on) prov::vu_run(pc & 16383u, g_entries[(pc & 16383u) >> 3].key);
     if (unit == 1 && ps2::prof::g_on) prof_register_once();
     if (unit == 1) { static const bool log_runs = std::getenv("PS2_TRACE_VU1RUN") != nullptr; if (log_runs) std::fprintf(stderr, "[vu1-run] pc %X\n", pc); }
     // Compiled programs are the default; retain an interpreter override for
@@ -1325,9 +1834,18 @@ void run_entry(int unit, std::uint32_t pc) {
             const ProfTimer prof_timer(g_prof_compiled);
             static const bool timed = std::getenv("PS2_VU_TIME") != nullptr;
             if (timed) {
+                // a program that ends in a jump runs the next one from inside it (interpret's chaining): each is counted for its own time
+                // only (PS2_VU_TIME=excl), or with the programs it chained into (the default, as before)
+                static const bool exclusive = std::string(std::getenv("PS2_VU_TIME")).find("excl") != std::string::npos;
+                static std::uint64_t nested = 0;
+                const std::uint64_t outer_nested = nested;
+                nested = 0;
+                const std::uint32_t entry_pc = pc;
                 const std::uint64_t t0 = time_stamp();
                 fn(g_vu1, g_vu1_mem);
-                time_note(g_entries[(pc & 16383u) >> 3].key, time_stamp() - t0);
+                const std::uint64_t dt = time_stamp() - t0;
+                time_note(g_entries[(entry_pc & 16383u) >> 3].key, exclusive ? dt - std::min(dt, nested) : dt);
+                nested = outer_nested + dt;
                 return;
             }
             if (jit && jit != fn && ++sampled % 32 == 0) check_jit(fn, jit);
@@ -1432,6 +1950,14 @@ void run_fast(int n, std::uint32_t address) {
     static const bool record_jumps = !ps2::os::env("PS2_VU_RECORD").empty() || static_cast<bool>(g_options.on_vu_program);
     if (count && ++calls % 20000 == 0) std::fprintf(stderr, "[vu1] %llu calls, %llu instructions\n", (unsigned long long)calls, (unsigned long long)total);
     BranchView view;
+    const std::uint64_t run_number = n == 1 ? ++g_vu1_run_number : 0;
+    const bool tracing = n == 1 && vu1_debug().tracing(run_number);
+    const bool watching = n == 1 && watch_set().n != 0;
+    if (tracing) {
+        std::fprintf(stderr, "[vu1-t] run %llu starts at 0x%04X, TOP %u ITOP %u, vi:", static_cast<unsigned long long>(run_number), address & 16383u, g_top, g_itop);
+        for (int i = 0; i < 16; ++i) std::fprintf(stderr, " %04X", r.vi[i]);
+        std::fprintf(stderr, "\n");
+    }
     for (std::uint32_t steps = 0; steps < 1'000'000; ++steps, ++total) {
         if (!(steps & 0xFFu) && halted()) return;  // the window was closed: a program that does not end must not hold the close up for seconds
         std::uint32_t lo, hi;
@@ -1452,6 +1978,7 @@ void run_fast(int n, std::uint32_t address) {
             ++pipe.t;
         }
         read_q(u, pipe, r, current, hi);
+        if (watching) watch_snapshot();
         fast_upper(r, d, out);
         std::uint16_t was[16];
         view.snapshot(r, was);
@@ -1489,9 +2016,15 @@ void run_fast(int n, std::uint32_t address) {
         r.vf[0].w[2] = 0;
         r.vf[0].w[3] = fp::kOne;
         r.vi[0] = 0;
+        if (tracing) trace_vu1_step(run_number, steps, current, lo, hi, r, out.target, out.value, out.dest, was);
+        if (watching) watch_report("vu1 run", run_number, steps, lo, hi);
+        kick_step();
         if (ending) {
+            kick_flush();
             pipe.flush_q(r);
             r.tpc = pc;
+            if (n == 1 && vu1_debug().dump_run == run_number && !vu1_debug().dump_dir.empty())
+                dump_vu1_state(vu1_debug().dump_dir + "/vu1_run_" + std::to_string(run_number) + ".txt", "after the run PS2_VU1_DUMP_RUN names");
             return;
         }
         if (hi & 0x40000000u) ending = true;
@@ -1603,7 +2136,9 @@ void run_reference(int n, std::uint32_t address) {
         r.vf[0].w[2] = 0;
         r.vf[0].w[3] = fp::kOne;
         r.vi[0] = 0;
+        kick_step();
         if (ending) {
+            kick_flush();
             if (log_calls && n == 0) log_state("vu0ret");
             pipe.flush_q(r);
             r.tpc = pc;
@@ -1639,6 +2174,11 @@ void vcallms(Cpu &, std::uint32_t address) { vu::run(0, address); }
 __attribute__((weak)) void register_generated_vu() { ps2::vu::register_programs(nullptr, 0); }
 
 namespace ps2::vu {
+
+// The watch of PS2_VU1_WATCH for the VIF1: before and after an UNPACK (vif.cpp).
+bool watching_vu1() { return watch_set().n != 0; }
+void watch_vu1_snapshot() { watch_snapshot(); }
+void watch_vu1_report(const char *who, std::uint32_t cmd, std::uint32_t num, std::uint32_t a, std::uint32_t b) { watch_report(who, cmd, num, a, b); }
 
 // PS2_DUMP_VU1AT (see the GS draw trace): the vector registers and the 16 KiB of data memory of unit 1, as text, at one primitive.
 void trace_dump(const char *path) {

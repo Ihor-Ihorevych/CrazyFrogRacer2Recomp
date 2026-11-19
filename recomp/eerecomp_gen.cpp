@@ -302,6 +302,7 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         options.output = ps2::os::utf8(out_dir);
         options.live_stamp = request.stamp;
         options.quiet = true;
+        options.aspect_knobs = request.aspect_knobs;
         const auto coding = std::chrono::steady_clock::now();
         generate(translations, options);
         result.codegen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - coding).count();

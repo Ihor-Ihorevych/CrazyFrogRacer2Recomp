@@ -69,6 +69,7 @@ else()
         runtime/src/memory.cpp
         runtime/src/os.cpp
         runtime/src/prof.cpp
+        runtime/src/prov.cpp
         runtime/src/dispatch.cpp
         runtime/src/system.cpp
         runtime/src/kernel.cpp
@@ -530,7 +531,9 @@ if(PS2_GENERATED)
     if(ANDROID)
         # libmain.so, loaded by SDL's Java activity (android/); there is no executable on Android
         add_library(ps2run SHARED host/main.cpp host/crash.cpp host/android_touch.cpp)
-        set_target_properties(ps2run PROPERTIES OUTPUT_NAME main)
+        # PS2_ANDROID_LIB_NAME: another app already has a libmain.so (Flipendo: libps2main.so)
+        set(PS2_ANDROID_LIB_NAME "main" CACHE STRING "libNAME.so of the Android runner")
+        set_target_properties(ps2run PROPERTIES OUTPUT_NAME ${PS2_ANDROID_LIB_NAME})
         target_link_libraries(ps2run PRIVATE android log)
     else()
         add_executable(ps2run host/main.cpp host/crash.cpp)  # crash.cpp: the lines a crash writes to the log

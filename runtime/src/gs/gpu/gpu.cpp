@@ -464,6 +464,9 @@ struct Job {
     WGPUTexture texture = nullptr;  // present this surface texture after the submit (with its view)
     WGPUTextureView view = nullptr;
     WGPUBuffer data = nullptr, params = nullptr;
+    hwr::Handoff *hwr_h = nullptr;  // the hardware renderer's releases, done after the submit (hwr.cpp handoff)
+    std::vector<std::uint32_t> cache_words;                // the frame's writes into the upload cache (g_cache_pending), done first
+    std::vector<std::array<std::uint32_t, 2>> cache_at;
     bool measure = false, writes = false;  // writes: the job writes the arena, shape and parameter records first
     bool blit = false;                     // and before them present()'s picture parameters
     std::uint32_t blit_words[12] = {};
@@ -471,16 +474,27 @@ struct Job {
     Words shapes;
     std::size_t shape_words = 0;
     std::vector<std::array<std::uint32_t, kParamStride / 4>> records;
+    // The picture, done by the job itself (present() with the submit thread): acquire the screen's next texture, draw the picture into it
+    // (the present pass, in an encoder of its own after the frame's commands) and present it. The drawing thread never touches the surface,
+    // so it does not wait for the last picture's present (which returns when the card has finished that picture) before it goes on.
+    bool present = false;
+    WGPUBindGroup picture = nullptr, overlay_group = nullptr;  // (referenced for the job: AddRef, released after it ran)
+    WGPURenderPipeline overlay_pipeline = nullptr, picture_pipeline = nullptr;
+    float view_box[4] = {}, overlay_box[4] = {};
+    bool draw_picture = true, draw_overlay = false;
 };
 struct State {
+    static constexpr int kDepth = 3;  // jobs the drawing thread may run ahead of the submit thread
     std::mutex mutex;
     std::condition_variable cv;
-    bool busy = false;
-    Job job;
-    std::atomic<std::uint64_t> ns{0}, jobs{0};  // the thread's time in jobs, for PS2_GPU_WGPU_TIME
+    int head = 0, tail = 0, count = 0;  // the ring: the thread runs jobs[head], the drawing thread fills jobs[tail]
+    Job jobs[kDepth];
+    std::atomic<std::uint64_t> ns{0}, jobs_run{0};  // the thread's time in jobs, for PS2_GPU_WGPU_TIME
 };
+std::atomic<bool> g_reconfigure_pending{false};  // a job's acquire said the surface is out of date: present() reconfigures it before the next picture
 State *g_state = nullptr;  // made at the first hand-over and never freed (a detached thread may still wait on it at exit)
 void drain();
+void present_job(Job &j);  // the job's picture (defined with the surface's helpers, below)
 WGPUTexture g_present_texture = nullptr;  // present() sets it around submit(view): the texture the job presents and releases
 bool g_presented_async = false;           // the last submit() handed its picture over: the job presents it
 std::uint32_t g_blit[12] = {};             // present()'s picture parameters for the present pass, written by the next submit
@@ -875,6 +889,17 @@ struct CacheEntry {
 };
 
 WGPUBuffer g_cache = nullptr;
+std::vector<std::uint32_t> g_cache_pending;             // writes into g_cache that wait for the next submit (cache_insert, with the submit thread): their words,
+std::vector<std::array<std::uint32_t, 2>> g_cache_pending_at;  // and each one's offset and size in words
+void write_cache_pending() {  // the writes straight to the queue (nothing is in flight: submit() drained)
+    std::size_t at = 0;
+    for (const auto &w : g_cache_pending_at) {
+        wt::write(g_queue, g_cache, static_cast<std::uint64_t>(w[0]) * 4, g_cache_pending.data() + at, static_cast<std::uint64_t>(w[1]) * 4);
+        at += w[1];
+    }
+    g_cache_pending.clear();
+    g_cache_pending_at.clear();
+}
 std::vector<std::uint32_t> g_cache_copy;
 std::deque<CacheEntry> g_cache_ring;
 std::unordered_multimap<std::uint64_t, CacheEntry *> g_cache_index;
@@ -941,8 +966,15 @@ bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, s
     to[words - 1] = 0;
     to[words - 2] = 0;
     std::memcpy(to, bytes, n);
-    post::drain();
-    wt::write(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
+    if (post::enabled()) {
+        // with the submit thread the write waits in a list and goes with the frame's job (before the job's own commands, after the last job's):
+        // draining here made the drawing thread wait for the last picture's whole submit and present (10 to 15 ms) at the first new upload of every frame
+        g_cache_pending_at.push_back({offset, words});
+        g_cache_pending.insert(g_cache_pending.end(), to, to + words);
+    } else {
+        post::drain();
+        wt::write(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
+    }
     g_cache_ring.push_back({key, offset, words, n, g_serial, ++g_cache_uids});
     g_cache_uid = g_cache_uids;
     g_cache_index.emplace(key, &g_cache_ring.back());
@@ -2397,7 +2429,7 @@ void queue_pre(const PreOp &op) {
     g_pre.push_back(op);
 }
 
-void submit(WGPUTextureView present_view);
+void submit(WGPUTextureView present_view, bool present_job);
 // submits made because the upload cache's ring wrapped, this frame (flush() starts a frame at 0): at most one, else a movie (hundreds of
 // small repeated uploads a frame) made ~40 submits a frame, each a few milliseconds of driver time on a phone
 std::uint32_t g_ring_submits = 0;
@@ -2425,7 +2457,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
             if (!cached && !g_cache_ring.empty() && g_cache_ring.front().used == g_serial && g_ring_submits < 1) {
                 ++g_ring_submits;
                 emit_all();
-                submit(nullptr);
+                submit(nullptr, false);
                 cached = cache_insert(key, bytes, n, offset);
             }
         }
@@ -2527,6 +2559,15 @@ namespace post {
 void run(Job &j) {
     const auto from = std::chrono::steady_clock::now();
     ps2::prof::set(ps2::prof::kWgpuBase + wt::kWrite);
+    {
+        std::size_t at = 0;
+        for (const auto &w : j.cache_at) {
+            wgpuQueueWriteBuffer(g_queue, g_cache, static_cast<std::uint64_t>(w[0]) * 4, j.cache_words.data() + at, static_cast<std::uint64_t>(w[1]) * 4);
+            at += w[1];
+        }
+        j.cache_words.clear();
+        j.cache_at.clear();
+    }
     if (j.blit) wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, j.blit_words, sizeof j.blit_words);
     j.blit = false;
     if (j.writes) {
@@ -2534,12 +2575,18 @@ void run(Job &j) {
         if (j.shape_words) wgpuQueueWriteBuffer(g_queue, j.data, j.arena.size() * 4, j.shapes.data(), j.shape_words * 4);
         wgpuQueueWriteBuffer(g_queue, j.params, 0, j.records.data(), j.records.size() * kParamStride);
     }
+    if (j.hwr_h) hwr::handoff_write(j.hwr_h);  // the renderer's vertices and parameters
     ps2::prof::set(ps2::prof::kWgpuBase + wt::kFinish);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(j.enc, nullptr);
     ps2::prof::set(ps2::prof::kWgpuBase + wt::kSubmit);
     wgpuQueueSubmit(g_queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(j.enc);
+    if (j.hwr_h) hwr::handoff_release(j.hwr_h);
+    j.hwr_h = nullptr;
+    if (j.data) wgpuBufferRelease(j.data);  // (the job's own references, taken at the hand-over)
+    if (j.params) wgpuBufferRelease(j.params);
+    j.data = j.params = nullptr;
     ps2::prof::set(ps2::prof::kWgpuBase + wt::kCopy);
     if (j.measure) {
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
@@ -2549,6 +2596,7 @@ void run(Job &j) {
     }
     ps2::prof::set(ps2::prof::kWgpuBase + wt::kPoll);
     wgpuDevicePoll(g_device, false, nullptr);
+    if (j.present) present_job(j);
     if (j.view) {
         ps2::prof::set(ps2::prof::kWgpuBase + wt::kPresent);
         wgpuSurfacePresent(g_surface);
@@ -2564,7 +2612,7 @@ void run(Job &j) {
     j.shape_words = 0;
     j.records.clear();
     g_state->ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
-    ++g_state->jobs;
+    ++g_state->jobs_run;
 }
 
 #ifdef _WIN32
@@ -2585,41 +2633,48 @@ void loop() {
     for (;;) {
         {
             const ps2::prof::Scope prof_scope(ps2::prof::kPostWait);
-            g_state->cv.wait(lock, [] { return g_state->busy; });
+            g_state->cv.wait(lock, [] { return g_state->count > 0; });
         }
         lock.unlock();
         {
             const ps2::prof::Scope prof_scope(ps2::prof::kPostWork);
-            run(g_state->job);
+            run(g_state->jobs[g_state->head]);
         }
         lock.lock();
-        g_state->busy = false;
+        g_state->head = (g_state->head + 1) % State::kDepth;
+        --g_state->count;
         g_state->cv.notify_all();
     }
 }
 
+// Every hand-over is submitted (and its picture presented): the drawing thread's own queue and surface work waits for this.
 void drain() {
     if (!g_state) return;
     std::unique_lock<std::mutex> lock(g_state->mutex);
-    if (!g_state->busy) return;
+    if (g_state->count == 0) return;
     wt::Scope s(wt::kDrain);
-    g_state->cv.wait(lock, [] { return !g_state->busy; });
+    g_state->cv.wait(lock, [] { return g_state->count == 0; });
 }
 
-// The job to fill: the last one is done, the thread exists.
+// The job to fill: a place in the ring is free (the drawing thread runs up to kDepth jobs ahead), the thread exists.
 Job &slot() {
     if (!g_state) {
         g_state = new State;
         std::thread(loop).detach();
         std::atexit([] { drain(); });  // the last picture is submitted before the library is torn down
     }
-    drain();
-    return g_state->job;
+    std::unique_lock<std::mutex> lock(g_state->mutex);
+    if (g_state->count >= State::kDepth) {
+        wt::Scope s(wt::kDrain);
+        g_state->cv.wait(lock, [] { return g_state->count < State::kDepth; });
+    }
+    return g_state->jobs[g_state->tail];
 }
 
 void go() {
     std::lock_guard<std::mutex> lock(g_state->mutex);
-    g_state->busy = true;
+    g_state->tail = (g_state->tail + 1) % State::kDepth;
+    ++g_state->count;
     g_state->cv.notify_all();
 }
 }  // namespace post
@@ -2627,7 +2682,7 @@ void go() {
 bool wt::post_totals(std::uint64_t &ns, std::uint64_t &jobs) {
     if (!post::g_state) return false;
     ns = post::g_state->ns;
-    jobs = post::g_state->jobs;
+    jobs = post::g_state->jobs_run;
     return true;
 }
 
@@ -2964,28 +3019,40 @@ Layout display_layout(float sw, float sh) {
 }
 std::uint32_t fbits(float f) { std::uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
+// Whether the submit thread can take this run's submits at all, and whether it takes everything of them (writes and the picture too).
+bool post_usable() { return post::enabled() && !g_live && !hwcache::g_on && !ps2::hitch::on() && !g_bench.configured && !hw::g_memlog; }
+bool post_pipelined() { return post_usable() && post::mode() == 1; }
+
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
-void submit(WGPUTextureView present_view = nullptr) {
+// present_view: the screen texture to draw the picture into (without the submit thread); present_job: the job does the whole picture (post::present_job).
+void submit(WGPUTextureView present_view = nullptr, bool present_job = false) {
+    const bool want_present = present_view != nullptr || present_job;
     const auto write_blit = [] {  // present()'s parameters, when this submit does not hand them to the job
         if (!post::g_blit_pending) return;
         post::drain();
         wt::write(g_queue, g_blit_params, 0, post::g_blit, sizeof post::g_blit);
         post::g_blit_pending = false;
     };
-    if (g_commands.empty() && !present_view
+    if (g_commands.empty() && !want_present
         && !(g_live && hw::live_pending())
         && !hwr::pending()
         ) {
         write_blit();
         return;
     }
-    post::drain();  // the last hand-over is submitted (and its picture presented) before anything of this one reaches the queue
+    // the submit thread takes the writes, finish, submit and present (post above); a present only with its surface texture (present())
+    const bool async = post_usable() && (!present_view || post::g_present_texture);
+    // everything of this submit goes with the job (nothing of it touches the queue from this thread): the last hand-overs need not be done first,
+    // the drawing thread runs up to post::State::kDepth jobs ahead
+    const bool pipelined = async && post::mode() == 1 && !present_view;
+    if (!pipelined) post::drain();  // the last hand-over is submitted (and its picture presented) before anything of this one reaches the queue
     finish_tiles(true);  // the helper's lists go into the arena before it is measured, copied or uploaded
     fuse_runs();  // before place_shapes: the dispatches it makes keep the shape records' offset in more places, and it adds tables to the arena
     place_shapes();
     if (g_bench.capturing) bench_capture();
     if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
         write_blit();
+        write_cache_pending();
         profile_submit();
         return;
     }
@@ -2993,7 +3060,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     const bool card_work = g_live && hw::live_pending();
     if (card_work) hw::live_prepare();
     const bool hwr_work = hwr::pending();  // PS2_RENDERER=hw: the hardware renderer's passes go into this encoder in stream order
-    if (hwr_work) hwr::prepare();
+    if (hwr_work) hwr::prepare(pipelined);  // (pipelined: its vertex and parameter writes go with the job, hwr::handoff)
     if (ps2::hitch::on()) {
         for (const Command &c : g_commands) {
             ++g_hitch_now.commands[c.pipeline];
@@ -3002,13 +3069,11 @@ void submit(WGPUTextureView present_view = nullptr) {
         g_hitch_now.arena_bytes += (g_arena.size() + g_shapes.begin) * 4;
         ++g_hitch_now.submits;
     }
-    // the submit thread takes the writes, finish, submit and present (post above); a present only with its surface texture (present())
-    const bool async = post::enabled() && !g_live && !hwr::g_on && !hwcache::g_on && !ps2::hitch::on() && !g_bench.configured && !hw::g_memlog
-        && (!present_view || post::g_present_texture);
     post::g_presented_async = false;
     const bool post_writes = async && post::mode() == 1;
-    const bool post_blit = post::g_blit_pending && post_writes && present_view;
+    const bool post_blit = post::g_blit_pending && post_writes && want_present;
     if (!post_blit) write_blit();  // first, as present() did before
+    if (!async) write_cache_pending();
     if (!post_writes) {
         upload_data();
         wt::write(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
@@ -3042,10 +3107,19 @@ void submit(WGPUTextureView present_view = nullptr) {
     writes.endOfPassWriteIndex = 1;
     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
     if (measure) cd.timestampWrites = &writes;
+    // PS2_GPU_PROFILE=1: each compute pass of a renderer frame is a timed piece named after the programs it runs (hwr.cpp prof_compute)
+    int prof_piece = -1;
+    const auto begin_pass = [&]() {
+        WGPUComputePassDescriptor d = cd;
+        WGPUPassTimestampWrites tw = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+        prof_piece = hwr_work && !measure ? hwr::prof_compute(tw) : -1;
+        if (prof_piece >= 0) d.timestampWrites = &tw;
+        return wgpuCommandEncoderBeginComputePass(enc, &d);
+    };
     WGPUComputePassEncoder pass;
     {
         wt::Scope s(wt::kBeginPass);
-        pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+        pass = begin_pass();
     }
     Pipeline current = kPipelines;
     bool current_mip = false;
@@ -3062,17 +3136,18 @@ void submit(WGPUTextureView present_view = nullptr) {
     for (const Command &c : g_commands) {
         if (card_work && hw::live_before(command_index)) {  // the card's work that goes before this command (the order of the command stream)
             pass = hw::live_encode(enc, command_index, pass);  // may go on in this compute pass or end it
-            if (!pass) pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+            if (!pass) pass = begin_pass();
             current = kPipelines;
         }
         if (hwr_work && hwr::before(command_index)) {
             pass = hwr::encode(enc, command_index, pass);  // ends the compute pass; render passes and copies follow
-            if (!pass) pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+            if (!pass) pass = begin_pass();
             current = kPipelines;
         }
         ++command_index;
         ++g_dispatches[c.pipeline];
         if ((skip & (1u << c.pipeline)) || hwr::g_sweep == 4) continue;
+        if (prof_piece >= 0) hwr::prof_name(prof_piece, kEntryPoints[c.pipeline]);
         if (c.pipeline != current || c.mip != current_mip) {
             wt::Scope s(wt::kSetPipeline);
             wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
@@ -3098,7 +3173,7 @@ void submit(WGPUTextureView present_view = nullptr) {
         wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
     }
-    if (present_view && g_prep.pending) {  // the picture the present pass reads (blit.wgsl prep_mem / prep_tex)
+    if (want_present && g_prep.pending) {  // the picture the present pass reads (blit.wgsl prep_mem / prep_tex)
         WGPUComputePassEncoder cp = wgpuCommandEncoderBeginComputePass(enc, nullptr);
         wgpuComputePassEncoderSetPipeline(cp, g_prep.pending == 2 ? g_prep.tex : g_prep.mem);
         wgpuComputePassEncoderSetBindGroup(cp, 0, g_prep.pending == 2 ? g_prep.tex_group[g_prep.slot] : g_prep.mem_group, 0, nullptr);
@@ -3142,9 +3217,34 @@ void submit(WGPUTextureView present_view = nullptr) {
         post::Job &j = post::slot();
         j.enc = enc;
         j.measure = measure;
+        if (hwr_work) j.hwr_h = hwr::handoff(pipelined);
         j.data = g_data;
         j.params = g_params;
+        wgpuBufferAddRef(j.data);  // (the buffers may grow, and be replaced, before the job runs)
+        wgpuBufferAddRef(j.params);
         if (present_view) j.view = present_view, j.texture = post::g_present_texture;
+        if (present_job) {  // the picture is the job's too: how the present pass draws it
+            const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
+            const Layout lay = display_layout(w, h);
+            j.present = true;
+            j.view_box[0] = lay.x, j.view_box[1] = lay.y, j.view_box[2] = lay.w, j.view_box[3] = lay.h;
+            j.picture = g_prep.show ? g_prep.show : g_blit_group;
+            j.picture_pipeline = g_blit;
+            j.draw_picture = hwr::g_sweep != 3 && j.picture != nullptr;
+            if (j.picture) wgpuBindGroupAddRef(j.picture);
+            j.draw_overlay = g_overlay.on && g_overlay.group && g_surface_width && g_surface_height;
+            if (j.draw_overlay) {
+                const std::uint32_t ox = std::min(g_overlay.x, g_surface_width - 1), oy = std::min(g_overlay.y, g_surface_height - 1);
+                const std::uint32_t ow = std::min(g_overlay.width, g_surface_width - ox), oh = std::min(g_overlay.height, g_surface_height - oy);
+                j.overlay_box[0] = static_cast<float>(ox), j.overlay_box[1] = static_cast<float>(oy);
+                j.overlay_box[2] = static_cast<float>(ow), j.overlay_box[3] = static_cast<float>(oh);
+                j.overlay_group = g_overlay.group;
+                j.overlay_pipeline = g_overlay.pipeline;
+                wgpuBindGroupAddRef(j.overlay_group);
+            }
+        }
+        std::swap(j.cache_words, g_cache_pending);  // the job's lists were emptied when it ran
+        std::swap(j.cache_at, g_cache_pending_at);
         j.writes = post_writes;
         j.blit = post_blit;
         if (post_blit) std::memcpy(j.blit_words, post::g_blit, sizeof post::g_blit), post::g_blit_pending = false;
@@ -4205,10 +4305,43 @@ static std::uint32_t hwr_position() {
     emit_pre();
     return static_cast<std::uint32_t>(g_commands.size());
 }
+// Decodes that follow each other in the command stream (nothing was uploaded, no palette loaded between them: the texture levels of a frame)
+// are one dispatch with a table of levels (gs.wgsl decode): a dispatch and its barrier cost the phone's card ~50 us each, and a frame has ~130.
+// PS2_DECODE_BATCH=0 turns it off.
+static std::size_t g_decode_batch_at = SIZE_MAX;  // the index in g_commands of the decode command that the next decode may join
+static std::uint32_t g_decode_batch_param = 0, g_decode_batch_texels = 0;
+static std::vector<std::array<std::uint32_t, 4>> g_decode_batch_rows;
+constexpr std::size_t kDecodeBatchMax = 64;
 static std::uint32_t hwr_decode(const std::uint32_t *setup, std::uint32_t out_word, std::uint32_t words) {
+    static const bool batching = os::env("PS2_DECODE_BATCH") != "0";
     emit_pre();
     const std::uint32_t at = arena_append(setup, kSetupWords * 4);
-    dispatch_linear(kDecode, words, push_params({at, out_word, words}));
+    if (batching && g_decode_batch_at != SIZE_MAX && g_decode_batch_at + 1 == g_commands.size() && g_commands.back().pipeline == kDecode &&
+        g_commands.back().param == g_decode_batch_param && g_decode_batch_rows.size() < kDecodeBatchMax && words) {
+        g_decode_batch_rows.push_back({at, out_word, words, g_decode_batch_texels});
+        g_decode_batch_texels += words;
+        const std::uint32_t table = arena_append(g_decode_batch_rows.data(), g_decode_batch_rows.size() * 16);
+        std::array<std::uint32_t, kParamStride / 4> &record = g_param_records[g_decode_batch_param];
+        record = {};
+        record[2] = g_decode_batch_texels;
+        record[3] = static_cast<std::uint32_t>(g_decode_batch_rows.size());
+        record[4] = table;
+        const std::uint32_t groups = (g_decode_batch_texels + 63) / 64;
+        g_commands.back().x = std::min(groups, 1024u);
+        g_commands.back().y = (groups + 1023) / 1024;
+        return static_cast<std::uint32_t>(g_commands.size());
+    }
+    const std::size_t before = g_commands.size();
+    const std::uint32_t param = push_params({at, out_word, words});
+    dispatch_linear(kDecode, words, param);
+    if (batching && g_commands.size() == before + 1) {
+        g_decode_batch_at = before;
+        g_decode_batch_param = param;
+        g_decode_batch_texels = words;
+        g_decode_batch_rows.assign(1, {at, out_word, words, 0});
+    } else {
+        g_decode_batch_at = SIZE_MAX;
+    }
     return static_cast<std::uint32_t>(g_commands.size());
 }
 static std::uint32_t hwr_params(const std::uint32_t *words, std::uint32_t count) {
@@ -4515,7 +4648,7 @@ bool init(Mode m) {
     if (hwr::requested() && !g_live) {  // PS2_RENDERER=hw: the hardware renderer draws (hwr.cpp), its targets at PS2_SCALE
         const hwr::Context hc{g_device, g_queue, g_decoded, static_cast<std::uint64_t>(kCachedWords) + kDecodedWords, g_layout, &g_group, kParamStride, kGsShader, g_swizzle.data(),
                               wgpuDeviceHasFeature(g_device, WGPUFeatureName_DualSourceBlending) != 0, hwr_position, hwr_decode, hwr_params, fmt_words, hwr_submit, g_scale,
-                              static_cast<float>(std::atof(os::env("PS2_HWR_SCALE").c_str())), g_gl};
+                              static_cast<float>(std::atof(os::env("PS2_HWR_SCALE").c_str())), g_gl, g_swizzle.size(), g_clut, g_vram};
         if (!hwr::init(hc)) std::fprintf(stderr, "[hwr] the hardware renderer could not start, the exact renderer draws\n");
     }
     g_mode = m;
@@ -4940,10 +5073,11 @@ static void frame_gpu_time() {
     if (g_sweep_on) {
         static const int part_s = std::max(1, std::atoi(os::env("PS2_GPU_SWEEP_S").c_str()) > 0 ? std::atoi(os::env("PS2_GPU_SWEEP_S").c_str()) : 8);  // seconds per part
         if (std::chrono::steady_clock::now() - since < std::chrono::seconds(part_s)) return;
-        static const char *const kPart[5] = {"A all", "B passes without draws", "C no render passes", "D no picture in present", "E no compute (uploads, palettes, decodes)"};
+        static const char *const kPart[8] = {"A all", "B passes without draws", "C no render passes", "D no picture in present", "E no compute (uploads, palettes, decodes)",
+                                             "F no target<->memory transfers (stores, loads)", "G no target self copies", "H no texture level copies"};
         std::fprintf(stderr, "[gpu-sweep] frame %llu: %s: card time per frame %.2f ms mean, %.2f ms worst over %u frames\n", static_cast<unsigned long long>(frame_count()),
                      kPart[hwr::g_sweep], sum / frames, worst, frames);
-        hwr::g_sweep = (hwr::g_sweep + 1) % 5;
+        hwr::g_sweep = (hwr::g_sweep + 1) % 8;
         sum = worst = 0, frames = 0;
         since = std::chrono::steady_clock::now();
         return;
@@ -5576,6 +5710,65 @@ void dump_prepared() {
     wgpuBufferRelease(buf);
 }
 
+namespace {
+namespace post {
+// The submit thread's part of a picture (the job's frame commands were submitted just before): acquire the next screen texture, draw the
+// picture into it with the present pass, submit that and present. A missed acquire only drops this picture (as present() does when it acquires).
+void present_job(Job &j) {
+    ps2::prof::set(ps2::prof::kWgpuBase + wt::kAcquire);
+    WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
+    const auto from = std::chrono::steady_clock::now();
+    wgpuSurfaceGetCurrentTexture(g_surface, &st);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count();
+    const bool reconfigure = note_acquire(st.status, ms);
+    if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
+        if (st.texture) wgpuTextureRelease(st.texture);
+        if (reconfigure) g_reconfigure_pending = true;
+    } else {
+        ps2::prof::set(ps2::prof::kWgpuBase + wt::kRenderPass);
+        WGPUTextureView view = wgpuTextureCreateView(st.texture, nullptr);
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+        WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+        color.view = view;
+        color.loadOp = WGPULoadOp_Clear;
+        color.storeOp = WGPUStoreOp_Store;
+        color.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
+        WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+        rd.colorAttachmentCount = 1;
+        rd.colorAttachments = &color;
+        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+        wgpuRenderPassEncoderSetViewport(rp, j.view_box[0], j.view_box[1], j.view_box[2], j.view_box[3], 0.0f, 1.0f);
+        if (j.draw_picture) {
+            wgpuRenderPassEncoderSetPipeline(rp, j.picture_pipeline);
+            wgpuRenderPassEncoderSetBindGroup(rp, 0, j.picture, 0, nullptr);
+            wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+        }
+        if (j.draw_overlay) {
+            wgpuRenderPassEncoderSetViewport(rp, j.overlay_box[0], j.overlay_box[1], j.overlay_box[2], j.overlay_box[3], 0.0f, 1.0f);
+            wgpuRenderPassEncoderSetPipeline(rp, j.overlay_pipeline);
+            wgpuRenderPassEncoderSetBindGroup(rp, 0, j.overlay_group, 0, nullptr);
+            wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+        }
+        wgpuRenderPassEncoderEnd(rp);
+        wgpuRenderPassEncoderRelease(rp);
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+        ps2::prof::set(ps2::prof::kWgpuBase + wt::kSubmit);
+        wgpuQueueSubmit(g_queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+        ps2::prof::set(ps2::prof::kWgpuBase + wt::kPresent);
+        wgpuSurfacePresent(g_surface);
+        wgpuTextureViewRelease(view);
+        wgpuTextureRelease(st.texture);
+    }
+    if (j.picture) wgpuBindGroupRelease(j.picture);
+    if (j.overlay_group) wgpuBindGroupRelease(j.overlay_group);
+    j.picture = j.overlay_group = nullptr;
+    j.present = false;
+}
+}  // namespace post
+}  // namespace
+
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
     static PresentLog log;
@@ -5618,7 +5811,8 @@ bool present(const DisplaySource &src) {
     const Layout lay = display_layout(sw, sh);
     const std::uint32_t blit[12] = {pw, ph, current, previous, blend ? (direct ? 2u : 1u) : 0u, static_cast<std::uint32_t>(lay.out_w), static_cast<std::uint32_t>(lay.out_h), ps2::video_options(),
                                     fbits(lay.scale[0]), fbits(lay.scale[1]), fbits(lay.offset[0]), fbits(lay.offset[1])};
-    post::drain();  // the last picture is presented before this one's acquire
+    const bool pipelined = post_pipelined();  // the submit thread acquires and presents; this thread goes on with the next picture meanwhile
+    if (!pipelined) post::drain();  // the last picture is presented before this one's acquire
     std::memcpy(post::g_blit, blit, sizeof blit);  // written by the next submit (its job with the submit thread), before the frame's other writes
     post::g_blit_pending = true;
     ++g_field;
@@ -5626,6 +5820,12 @@ bool present(const DisplaySource &src) {
     g_last_width = pw;
     g_last_height = ph;
     if (log.on) log.lap(log.flush);
+    if (pipelined) {
+        if (post::g_reconfigure_pending.exchange(false)) configure_surface();  // (it waits for the jobs first)
+        submit(nullptr, true);
+        dump_prepared();
+        return true;
+    }
     static FakeStatus fake;
     WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
     const auto acquire_from = PresentLog::Clock::now();

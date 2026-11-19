@@ -100,7 +100,11 @@ std::string hex(std::uint64_t v, int digits) { return lb::hex(v, digits); }
 std::vector<std::string> compile_flags() {
     std::string opt = "-O3";
     if (const std::string v = ps2::os::env("PS2_VU_LIVE_OPT"); !v.empty()) opt = v;
-    return lb::compile_flags(opt);
+    std::vector<std::string> flags = lb::compile_flags(opt);
+    // PS2_VU_MCPU=<name> (e.g. cortex-a715): the processor the vector programs are scheduled for (only these libraries: a change of flags makes
+    // every library of the cache again, and the translated game code is far dearer to make than these)
+    if (const std::string cpu = ps2::os::env("PS2_VU_MCPU"); !cpu.empty()) flags.push_back("-mcpu=" + cpu);
+    return flags;
 }
 
 // ---------------------------------------------------------------------------------------------------------------- loading

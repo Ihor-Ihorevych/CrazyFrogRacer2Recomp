@@ -30,6 +30,7 @@
 #include <ctime>
 #include <cwchar>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <stdexcept>
 #include <string_view>
@@ -750,7 +751,7 @@ int main(int argc, char **argv) {
     std::vector<std::string> args{from_disc ? std::string() : std::string(argv[1])};
     [[maybe_unused]] bool window = false, fullscreen = false;
     std::string load_path, given_game_dir;
-    bool no_record = false;
+    bool no_record = false, prebuild = false;
     ps2::g_options.disc_program = from_disc;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -776,6 +777,7 @@ int main(int argc, char **argv) {
             if (!ps2::load_patches(argv[++i])) return usage();
         }
         else if (a == "--trace-io") ps2::g_options.trace_io = true;
+        else if (a == "--prebuild") prebuild = true;   // translate and compile all of the program's code into the ee-live cache, then exit (docs/ps2-android.md)
         else if (a == "--trace-threads") ps2::g_options.trace_threads = true;
         else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
         else if (a == "--game-dir" && i + 1 < argc) given_game_dir = argv[++i];
@@ -908,7 +910,7 @@ int main(int argc, char **argv) {
     // The libraries go next to the game like the vector programs'; entries.txt and overlays\ of the game folder get what was found.
     {
         const std::string setting = ps2::os::env("PS2_EE_LIVE");
-        if (setting != "0" && setting != "off" && (window || !setting.empty() || use_self_bundle)) {
+        if (setting != "0" && setting != "off" && (window || prebuild || !setting.empty() || use_self_bundle)) {
             std::string cache = setting.empty() || setting == "1" || setting == "on" ? ps2::os::utf8(data_dir / "ee-live") : setting;
             if (use_self_bundle && (setting.empty() || setting == "1" || setting == "on")) {
                 const std::string packed = ps2::disc::ensure_bundle_live_cache("ee-live");  // libraries packed with the game
@@ -919,6 +921,33 @@ int main(int argc, char **argv) {
             else if (from_disc) ps2::ee::live::start(disc_elf, cache, ps2::os::utf8(game_dir));
             else ps2::ee::live::start(program_location, cache, ps2::os::utf8(game_dir));
         }
+    }
+    if (prebuild) {
+        // --prebuild: the program is loaded into memory and translated whole, compiled into the ee-live cache, and the runner ends. The
+        // exit code is 0 when everything is in the cache (or was before), 1 when something failed. Progress lines start with "[prebuild]".
+        // PS2_PREBUILD_PROGRESS=<file>: the newest line is also written there (the app has no console to read): the file holds just it.
+        static const std::string progress_file = ps2::os::env("PS2_PREBUILD_PROGRESS");
+        const auto note = [](const std::string &line) {
+            std::fprintf(stderr, "[prebuild] %s\n", line.c_str());
+            std::fflush(stderr);
+            if (!progress_file.empty()) {
+                std::ofstream out(ps2::os::path(progress_file), std::ios::trunc);
+                out << line << '\n';
+            }
+        };
+        if (!ps2::ee::live::active()) {
+            note("failed: no compiler or no usable cache folder (PS2_EE_LIVE=<folder>, PS2_LIVE_CXX, PS2_LIVE_FLAGS)");
+            return 1;
+        }
+        std::uint32_t entry = 0;
+        const bool loaded = from_disc ? ps2::load_elf(disc_elf, entry) : ps2::load_elf(program, entry);
+        if (!loaded) {
+            note("failed: cannot load the program");
+            return 1;
+        }
+        const bool ok = ps2::ee::live::prebuild(note);
+        note(ok ? "done" : "failed: see the log of the translation");
+        return ok ? 0 : 1;
     }
     const auto emulate = [&]() -> int {
         ps2::crash::enter_thread(ps2::crash::Thread::Game);  // the emulation thread (named again in ps2::run, the same name)

@@ -198,6 +198,26 @@ Changes (all PS2_RENDERER=hw unless noted):
 * App: resolution in percent of the screen's own pixels (100 % = one texel per screen pixel), "Game view: Widescreen / 4:3" (default
   widescreen; PS2_ASPECT = the real screen size).
 
+### Harry Potter and the Chamber of Secrets (SLES-51192): knobs found without a patch (2026-11-19)
+
+No community patch was used: the camera was traced in the game's own code.
+* `0x4E8EB0` is a virtual "aspect" getter that returns 4/3 (lui 0x3FAA + ori 0xAAAB); its one caller (0x1A75F0) only derives a vertical
+  value from it: scaling it zooms the picture in (the vertical view shrinks), so it is not the knob.
+* The 3D screen matrix (0x541740: 0.4583 across, -0.5 down at 4:3) is built at boot and on loads by 0x1DC940, called from 0x1BE3D8 with
+  768.0 for both axes (one lui, so not a knob either). Its horizontal scale is one `div.s f20 = across / 768` at **0x1DCA74**: knob power -1.
+  The vertical scale is left alone and the game's side clipping is 1 / that scale, so the world is drawn out to the new edges (the car and
+  the gate right of the heads scene, the barn wall left). `PS2_WATCH=541740,40` from boot finds the writer.
+* 3D HUD pieces (the button ring) go through the same matrix and keep their shape on screen; 2D pieces (subtitles, menus) are drawn in screen
+  coordinates and are widened with the picture.
+* Without PS2_ASPECT: Flipendo spam frames pixel-identical to the build before the knob.
+
+Translator changes for it: a knob on an `ori` that follows the knob's `lui` into the same register scales the whole 32-bit constant (the lui
+alone scaled only the high half and the ori ORed the original low bits back); a knob on a `div.s` scales its quotient (a camera scale that is
+computed, not loaded). The phone translates the game on the device: `PS2_ASPECT_KNOBS=<file>` gives the knobs to every live translation, they
+are part of the live stamp (libraries made with other knobs are dropped), and the widening reaches the libraries through `EeLiveHost::aspect_widen`.
+Live path frame at 20:9 identical to the static build's. App: Settings > Display > Game view (Widescreen default / Original 4:3, restarts),
+the knob table per serial in `Ps2Activity.aspectKnobs`.
+
 ## The screen's own resolution: what it costs and two cuts (2026-11-18)
 
 Phone at 2712 x 1215 (5.297 x 4.766): ~20-22 fps, the card the limit everywhere (menus 20.0-20.4 fps). PC at the same scale (RTX 4050,

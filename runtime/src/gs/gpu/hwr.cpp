@@ -8,10 +8,12 @@
 // PS2_HWR_CACHE_MB=<n> (texture cache budget, default 256), PS2_HWR_ORDER=stream (M1's order), PS2_HWR_DUMP=<frame> (that frame's
 // schedule), PS2_HWR_TIME=1 (card time per render pass), PS2_HWR_NOPASS=1|draws (measuring aid), PS2_HWR_PIPELINES=<file> (pipeline list).
 #include "hwr.hpp"
+#include "../../prov.hpp"
 
 #ifndef __EMSCRIPTEN__
 
 #include "ps2/os.hpp"
+#include "ps2/prof.hpp"
 
 #include <webgpu/wgpu.h>
 
@@ -24,6 +26,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -59,6 +62,7 @@ float g_fx = 1.0f, g_fy = 1.0f;
 // phone's own resolution they cost as much card time as the frame. A target's scale depends on its width only, so a colour target and the
 // depth target found for it (same size) always match.
 constexpr u32 kSmallWidth = 512;
+constexpr u32 kMaxRows = 576;  // the tallest target (a PAL frame); draws below it are cut (approximation "outside target")
 float g_small = 1.0f;  // the factor of the small targets' scale to the full one (<= 1)
 // PS2_HWR_ROWS: the screen's rows the picture fills (the app gives them). A frame-wide target whose first draw's scissor ends at row r is
 // drawn at most rows / r card texels per GS row down: the game's 384-row frame that it squeezes into a 256-row field then has the screen's
@@ -168,6 +172,9 @@ u64 g_block[kBlocks];     // content identity of each block (upload id and offse
 u8 g_blk_stale[kBlocks];  // the block was drawn into by a target and memory does not hold that picture
 int g_owner[kPages];      // the target that holds the page's picture, -1: memory holds it
 bool g_page_stale[kPages];
+u64 g_mem_read_submit[kPages];   // the submit in which a view-4 draw read the page of memory directly (hwr.wgsl from_mem); an upload or write-back into it later in that submit would change what the draw reads
+u64 g_mem_read_hits = 0, g_mem_read_changes = 0;
+u32 g_page_write[kPages], g_page_stored[kPages];   // draws into each page, and how many of them the last write-back to memory had (store_for_memory)
 u64 g_fresh = 1;          // counter for identities that match nothing
 u64 g_clut_id = 0;        // identity of the palette buffer's content (what the last palette loads put there)
 // texture_key's memo (resolve_texture): a page's generation is the memory change count when one of its blocks' identity or stale flag
@@ -181,15 +188,21 @@ u64 g_epoch = 1;          // bumped whenever an upload, a palette load or a chan
 // ---------------------------------------------------------------- counters
 enum Reason { kPrimKind, kDate, kFramePsm, kFbmsk, kBlend, kPabe, kNoDual, kTexTarget, kZeroWidth, kReasons };
 const char *const kReasonName[kReasons] = {"lines/points", "DATE", "frame format", "partial frame mask", "blend form", "PABE", "no dual-source", "texture in a target (other layout)", "fbw 0"};
-enum Approx { kOutside, kStaleTex, kColclamp, kRegionMip, kAfx, kDepthScale, kDeadLoad, kApproxes };
+enum Approx { kOutside, kStaleTex, kColclamp, kRegionMip, kAfx, kDepthScale, kDeadLoad, kMipLevel0, kStaleSelf, kApproxes };
 const char *const kApproxName[kApproxes] = {"outside target", "stale texture memory", "colour wrap", "mip with region clamp", "As > 0x80",
-                                            "depth write dropped (other scale)", "load not done (cleared)"};
+                                            "depth write dropped (other scale)", "load not done (cleared)", "mip read at level 0", "own target read as of earlier in the frame"};
 
 struct Counters {
     u64 shapes = 0, drawn = 0, skipped = 0, clears = 0;
     u64 fallback[kReasons] = {}, approx[kApproxes] = {};
     u64 draws = 0, passes = 0, pipelines = 0, groups = 0, vertices = 0;
     u64 lookups = 0, hits = 0, misses = 0, decoded_texels = 0, target_reads = 0, self_copies = 0, loads = 0, stores = 0, targets_made = 0;
+    u64 builds_epoch = 0; // of them only because the epoch moved on (same setup)
+    u64 builds = 0;       // shape states worked out (build_state: a new setup, or the epoch or submit moved on)
+    u64 view4_out = 0;    // view-4 shapes whose texels left the source target's pages (set up the old way)
+    u64 mipneed[8] = {};  // PS2_HWR_LOG=1: mipmapped draws by the number of levels (1..7) their corners can sample at most (a conservative bound)
+    u64 mipdraws = 0;     // mipmapped draws counted
+    double build_ms = 0;  // their time (PS2_HWR_LOG only)
     u64 nodes = 0, renames = 0, surfaces_made = 0, copy_bytes = 0, overwrites = 0, dead_depth = 0, dead_loads = 0, grown = 0, recycled = 0;
     u64 att_loads = 0, att_stores = 0, att_load_bytes = 0, att_store_bytes = 0;  // render pass attachments that are loaded / stored (tile memory traffic)
     double cpu_ms = 0, sched_ms = 0;
@@ -197,7 +210,8 @@ struct Counters {
 Counters F, T;  // this frame, the whole run
 u64 g_frames = 0;
 bool g_stream_order = false;  // PS2_HWR_ORDER=stream: no renaming, no reordering (M1's order; for comparing)
-bool g_dump_now = false;      // PS2_HWR_DUMP=<frame>: this frame's shapes and schedule are printed
+bool g_no_view4 = false;      // set while a shape whose texels leave its view-4 source target is set up again the old way (shape())
+bool g_dump_now = false;     // PS2_HWR_DUMP=<frame>: this frame's shapes and schedule are printed
 
 // ---------------------------------------------------------------- surfaces (M2: the card textures that hold a target's picture)
 // A target's picture lives in a surface. A full overwrite of the target (a clear, docs/hw-renderer-design.md 3.3 "renaming") gives it a new
@@ -235,6 +249,11 @@ struct Target {
     Surf *snap = nullptr;         // a copy of the picture for draws that read the target they draw into
     Surf *snap_of = nullptr;      // the surface it was copied from
     std::vector<Rect> dirty;      // what was drawn into the surface since the copy
+    std::vector<Rect> dirty_a;    // the part of it whose alpha was written (a draw that reads only the copy's alpha, view 3, needs no new copy for the rest)
+    std::vector<u64> page_snap_frame;  // view-4 self reads: per page of the target, the frame its part of the copy was brought up to date in
+                                       // (+1; read as of then for the rest of that frame, as store_for_memory once_per_frame writes a page back)
+    u64 writes = 0, stored = ~0ull;  // draws into it so far, and how many of them the last write-back to memory (store_for_memory) had
+    int sx0 = 0, sy0 = 0, sx1 = -1, sy1 = -1;  // the rectangle (target pixels) written back at that count
 };
 std::vector<std::unique_ptr<Target>> g_targets;
 std::vector<WGPUTexture> g_release_tex;
@@ -252,11 +271,12 @@ struct TexEntry {
     u64 last_frame = 0;
     u64 id = 0;  // resource id (the copies that fill it and the draws that read it)
     u64 dims = 0;  // size and levels: which entries a recycled one can stand for
+    bool transient = false;  // decoded from a target that was written back to memory (store_for_memory): the key never comes again, so it is recycled after a frame
 };
 // Entries not used for a second go here (by size) and are filled again for a new texture of that size: a movie's picture is a new texture
 // every frame, and making a card texture, its view and groups each frame cost the phone's driver more than the decode (texture_recycle).
 std::unordered_map<u64, std::vector<std::unique_ptr<TexEntry>>> g_tex_free;
-constexpr std::size_t kFreePerSize = 16;
+constexpr std::size_t kFreePerSize = 16, kFreePerSizeBig = 256;
 constexpr u64 kRecycleFrames = 50;
 std::unordered_map<u64, std::unique_ptr<TexEntry>> g_cache;
 u64 g_cache_bytes = 0, g_cache_budget = 256ull << 20;
@@ -325,6 +345,11 @@ std::vector<Item> g_items;
 std::vector<int> g_pass_ops;
 std::vector<DrawRec> g_final;
 std::vector<Vtx> g_vorder;
+// The vertices go to the card as they were recorded and a draw call merges only neighbours that are next to each other there (they nearly
+// always are: the schedule moves whole nodes). Copying all of them into draw order cost ~2 ms a frame on the PC for Harry Potter 2's 210000
+// vertices (7.5 MB), more on a phone. PS2_HWR_VORDER=1: the copy into draw order as before (more merged calls when nodes were moved).
+const bool g_reorder_verts = os::env("PS2_HWR_VORDER") == "1";
+inline const std::vector<Vtx> &vsource() { return g_reorder_verts ? g_vorder : g_verts; }
 std::size_t g_next_item = 0;
 
 WGPUBuffer g_vbuf = nullptr, g_pbuf = nullptr;
@@ -333,6 +358,11 @@ WGPUBindGroup g_param_group = nullptr;
 
 // ---------------------------------------------------------------- pipelines and layouts
 WGPUShaderModule g_module = nullptr, g_sync_module = nullptr;
+// The draw shader's address tables (view 4: a target read through graphics memory addresses as another format): gs.wgsl's tables (byte
+// offset inside a page of every pixel of each format, T4: nibble index) and their inverses for the target formats (CT32: word -> x | y << 8,
+// CT16 and CT16S: halfword -> x | y << 8), made once from gpu.cpp's copy.
+constexpr u32 kInv32 = 45056, kInv16 = kInv32 + 2048, kInv16S = kInv16 + 4096, kAddrWords = kInv16S + 4096;
+WGPUBuffer g_addr = nullptr;
 WGPUBindGroupLayout g_params_layout = nullptr, g_tex_layout = nullptr, g_store_layout = nullptr, g_load_layout = nullptr, g_depth_layout = nullptr;
 WGPUPipelineLayout g_draw_layout = nullptr;
 WGPUComputePipeline g_load_pipe = nullptr, g_store_pipe = nullptr, g_store_z_pipe = nullptr;
@@ -606,6 +636,7 @@ void drop_snap(Target &t) {
     retire(t.snap);
     t.snap = t.snap_of = nullptr;
     t.dirty.clear();
+    t.dirty_a.clear();
 }
 
 void release_target(int i) {
@@ -655,9 +686,11 @@ void rename(Target &t) {
     ++g_epoch;  // the setups that read this target take the new surface
 }
 
+int page_log();
 void lose_page(u32 page) {
     const int o = g_owner[page];
     if (o < 0) return;
+    if (static_cast<int>(page) == page_log()) std::fprintf(stderr, "[hwr-page] frame %llu page %u back to memory from target %d\n", static_cast<unsigned long long>(g_frames), page, o);
     g_owner[page] = -1;
     ++g_epoch;
     Target &t = *g_targets[static_cast<std::size_t>(o)];
@@ -665,8 +698,19 @@ void lose_page(u32 page) {
     if (!t.pages) release_target(o);
 }
 
+// PS2_HWR_PAGE_LOG=<page>: who takes that page of graphics memory (a target's draw) and when it goes back to memory (an upload)
+int page_log() {
+    static const int p = [] {
+        const std::string v = os::env("PS2_HWR_PAGE_LOG");
+        return v.empty() ? -1 : std::atoi(v.c_str());
+    }();
+    return p;
+}
 void take_page(int ti, u32 page) {
     if (g_owner[page] == ti) return;
+    if (static_cast<int>(page) == page_log())
+        std::fprintf(stderr, "[hwr-page] frame %llu page %u taken by target %d (bp %04X psm %02X) from %d\n", static_cast<unsigned long long>(g_frames), page, ti,
+                     g_targets[static_cast<std::size_t>(ti)]->bp, g_targets[static_cast<std::size_t>(ti)]->psm, g_owner[page]);
     lose_page(page);
     g_owner[page] = ti;
     ++g_targets[static_cast<std::size_t>(ti)]->pages;
@@ -752,7 +796,7 @@ void recycle(std::unordered_map<u64, std::unique_ptr<TexEntry>>::iterator it) {
     g_cache_bytes -= e->bytes;
     g_cache.erase(it);
     auto &free = g_tex_free[e->dims];
-    if (free.size() < kFreePerSize) free.push_back(std::move(e));
+    if (free.size() < (e->transient ? kFreePerSizeBig : kFreePerSize)) free.push_back(std::move(e));
     else drop_entry(*e);
 }
 
@@ -760,7 +804,7 @@ void cache_evict() {
     // entries not used for a second (a movie's pictures): recycled
     for (auto it = g_cache.begin(); it != g_cache.end();) {
         auto next = std::next(it);
-        if (it->second->last_frame + kRecycleFrames < g_frames) recycle(it);
+        if (it->second->last_frame + (it->second->transient ? 1 : kRecycleFrames) < g_frames) recycle(it);
         it = next;
     }
     if (g_cache_bytes <= g_cache_budget) return;
@@ -847,15 +891,24 @@ u64 texture_key_full(const u32 *w, const u32 *mip, u32 top, bool &stale) {
 }
 
 TexEntry *decode_texture(u64 key, const u32 *w, const u32 *mip, u32 top) {
+    if (prov::g_on) prov::count(prov::kDecodes);
     const u32 tw = w[15] & 0xFFu, th = w[15] >> 8;
     u32 levels = top + 1;
     levels = std::min(levels, std::max(tw, th) + 1);
+    // PS2_HWR_LEVELS=<n>: at most n mip levels are decoded per texture (default: all). Each level is a decode dispatch and a copy on the card; a phone
+    // is better off with 1 or 2 (the picture of far surfaces is a little sharper and shimmers more).
+    static const u32 max_levels = [] {
+        const std::string v = os::env("PS2_HWR_LEVELS");
+        return v.empty() ? 16u : static_cast<u32>(std::clamp(std::atoi(v.c_str()), 1, 16));
+    }();
+    levels = std::min(levels, max_levels);
     const u64 dims = (static_cast<u64>(tw) << 16) | (static_cast<u64>(th) << 8) | levels;
     std::unique_ptr<TexEntry> e;
     if (auto f = g_tex_free.find(dims); f != g_tex_free.end() && !f->second.empty()) {  // a recycled one: its texture, view and groups stay
         e = std::move(f->second.back());
         f->second.pop_back();
         e->last_frame = 0;
+        e->transient = false;
         ++F.recycled;
     } else {
         e = std::make_unique<TexEntry>();
@@ -919,11 +972,12 @@ struct DrawState {
     int sc[4] = {};
     double zscale = 1.0;
     u32 zmax = 0;
-    bool needs_depth = false, zwrite_any = false, cwrite_any = false, color_full = false;
+    bool needs_depth = false, zwrite_any = false, cwrite_any = false, awrite_any = false, color_full = false;
     bool self_read = false;
     bool zread = false;
 };
 DrawState g_ds;
+
 
 // premul: 0 the card multiplies, 1 the shader gives floor(Cs * FIX / 128) and the card adds it (the GS's truncation, exact), 2 ceil (for -Cs * FIX)
 bool blend_map(u32 A, u32 B, u32 Cc, u32 Dd, bool dual, bool alpha_written, PipeKey &k, bool &uses_as, bool &ok, u32 &premul) {
@@ -931,15 +985,31 @@ bool blend_map(u32 A, u32 B, u32 Cc, u32 Dd, bool dual, bool alpha_written, Pipe
     uses_as = false;
     premul = 0;
     k.blend = true;
-    if (Cc == 1) {  // destination alpha as the factor: never used by this game
+    static const bool dsta_approx = os::env("PS2_HWR_DSTA_APPROX") != "0";   // approximation: the card's destination alpha (0..255) as the factor, where the GS's is 0..128 (exact version: a shader that reads the destination); PS2_HWR_DSTA_APPROX=0 drops these shapes
+    if (Cc == 1 && dsta_approx) {
+        const WGPUBlendFactor one = WGPUBlendFactor_One, zero = WGPUBlendFactor_Zero, da = WGPUBlendFactor_DstAlpha, ida = WGPUBlendFactor_OneMinusDstAlpha;
+        if (A == 2 && B == 0 && Dd == 0) {  // Cs * (1 - Ad)
+            k.src = ida, k.dst = zero, k.op = WGPUBlendOperation_Add;
+            return true;
+        }
+        if (A == 0 && B == 2 && Dd == 1) {  // Cs * Ad + Cd
+            k.src = da, k.dst = one, k.op = WGPUBlendOperation_Add;
+            return true;
+        }
+    }
+    if (Cc == 1) {  // destination alpha as the factor: not done yet (see PS2_HWR_DSTA_APPROX)
         ok = false;
         return false;
     }
     WGPUBlendFactor cf = WGPUBlendFactor_Constant, icf = WGPUBlendFactor_OneMinusConstant;
     if (Cc == 0) {
         uses_as = true;
+        // Without dual-source blending the factor is the fragment's alpha, which is then what the card writes as alpha too (As/128 of full scale
+        // instead of the raw As). That only matters for a later read of the destination alpha, and a shape that is not drawn at all (the menu's
+        // text and buttons) matters more: drawn with that alpha, unless PS2_HWR_AS_STRICT=1 (the shapes are dropped as before).
+        static const bool strict = os::env("PS2_HWR_AS_STRICT") == "1";
         if (dual) cf = WGPUBlendFactor_Src1, icf = WGPUBlendFactor_OneMinusSrc1;
-        else if (!alpha_written) cf = WGPUBlendFactor_SrcAlpha, icf = WGPUBlendFactor_OneMinusSrcAlpha;
+        else if (!alpha_written || !strict) cf = WGPUBlendFactor_SrcAlpha, icf = WGPUBlendFactor_OneMinusSrcAlpha;
         else {
             ok = false;
             return false;
@@ -1004,12 +1074,82 @@ void fail(DrawState &s, Reason r) {
     s.reason = r;
 }
 
+// A draw reads a texture out of memory that a target holds in another format (the frame read as an 8-bit palette texture, a 128x160 target
+// read as 8H or 16 bit, a 16 bit target read as 8 bit: Harry Potter 2's ground, characters and walls do this to every frame). The card cannot
+// sample a target as another format, so the target is written back to graphics memory (the same store as a display or a save state needs)
+// and the texture is decoded from there like any texture. Done once per target until something is drawn into it again; the blocks it covers
+// get new versions then, so a texture cached from the older picture is not taken for this one. PS2_HWR_NOSTORE=1 turns it off (the old
+// behaviour: such shapes are not drawn).
+// once_per_frame: a page written back already in this frame is not written back again (its later draws are not seen by this read). For a
+// draw that reads the target it draws into through memory: Harry Potter 2's spell sparkles are drawn near the top-left corner of the frame and
+// textured from address 0, the frame's own corner (64x32 pixels read as T4/T8), so every batch of them read what the batch before drew and
+// broke the frame's render pass for a write-back, ~34 times a frame while a spell is cast. They now read the corner as it was at the
+// first such read of the frame. PS2_HWR_STALE_SELF=0 turns it off.
+u64 g_page_store_frame[kPages];
+void store_for_memory(int owner, u32 tbp, u32 tbw, u32 tpsm, u32 tw_log, u32 th_log, bool once_per_frame) {
+    Target &t = *g_targets[static_cast<std::size_t>(owner)];
+    // the part of the target the texture reads: the pages it covers, as a rectangle of the target's own page grid
+    const int pw = 64, ph = is16(t.psm) ? 64 : 32;
+    const int first_page = static_cast<int>(t.bp / 32), per_row = static_cast<int>(std::max<u32>(1, t.bw));
+    int rx0 = 1 << 30, ry0 = 1 << 30, rx1 = -1, ry1 = -1;
+    bool any = false;
+    // the pages the texture covers that something was drawn into since they were last written back: only those are stored (a texture whose
+    // pages were not drawn into again keeps its decoded copy, the block versions stay)
+    for_pages(tpsm, tbp, tbw, 0, 0, (1 << tw_log) - 1, (1 << th_log) - 1, [&](u32 page) {
+        const u32 pg = page & (kPages - 1);
+        any = true;
+        if (g_page_write[pg] == g_page_stored[pg]) return;
+        if (once_per_frame && g_page_store_frame[pg] == g_frames + 1) {
+            ++F.approx[kStaleSelf];
+            return;
+        }
+        const int rel = static_cast<int>(pg) - first_page;
+        if (rel < 0) return;
+        const int col = rel % per_row, row = rel / per_row;
+        rx0 = std::min(rx0, col * pw), ry0 = std::min(ry0, row * ph);
+        rx1 = std::max(rx1, col * pw + pw - 1), ry1 = std::max(ry1, row * ph + ph - 1);
+    });
+    if (!any || rx1 < 0) return;   // nothing new in the pages the texture reads
+    const int vw = std::clamp<int>(t.valid_w, 1, static_cast<int>(t.w)), vh = std::clamp<int>(t.valid_h, 1, static_cast<int>(t.h));
+    rx0 = std::max(rx0, 0), ry0 = std::max(ry0, 0), rx1 = std::min(rx1, vw - 1), ry1 = std::min(ry1, vh - 1);
+    if (rx1 < rx0 || ry1 < ry0) return;   // outside what was drawn: memory holds what it holds
+    for (int py = ry0 / ph; py <= ry1 / ph; ++py)
+        for (int px = rx0 / pw; px <= rx1 / pw; ++px) {
+            const u32 pg = static_cast<u32>(first_page + py * per_row + px) & (kPages - 1);
+            g_page_stored[pg] = g_page_write[pg];
+            g_page_store_frame[pg] = g_frames + 1;
+        }
+    const u32 x = static_cast<u32>(rx0), y = static_cast<u32>(ry0), w = static_cast<u32>(rx1 - rx0 + 1), h = static_cast<u32>(ry1 - ry0 + 1);
+    Op &op = add_op(t.depth ? kOpStoreZ : kOpStore);
+    const float scale = static_cast<float>(static_cast<double>(t.depth ? (t.psm == 0x30 ? 0xFFFFFFFFu : t.psm == 0x31 ? 0xFFFFFFu : 0xFFFFu) : 0u) + 1.0);
+    u32 sbits;
+    std::memcpy(&sbits, &scale, 4);
+    const u32 words[10] = {t.bp, t.bw, t.depth ? t.psm : t.last_psm, x, y, w, h, sbits, fbits(t.sc.x), fbits(t.sc.y)};
+    op.param = C.params(words, 10);
+    op.group = t.s->sync_group;
+    op.rd = t.s->id;
+    op.tgt = owner;
+    op.w = w, op.h = h;
+    ++F.stores;
+    if (prov::g_on) prov::count(prov::kStores), prov::count(prov::kStorePixels, static_cast<std::uint64_t>(w) * h);
+    for_blocks(t.psm, t.bp, t.bw, static_cast<int>(x), static_cast<int>(y), static_cast<int>(x + w) - 1, static_cast<int>(y + h) - 1, [&](u32 blk, int, int, u32, u32) {
+        g_block[blk] = mix(0x57C0ull, ++g_fresh);
+        g_blk_stale[blk] = 0;
+        g_page_stale[(blk / 32) & (kPages - 1)] = false;
+        touch_page(blk / 32);
+    });
+    ++g_epoch;
+}
+
+bool v4_mipmaps();
+
 void resolve_texture(DrawState &s, const u32 *w, const u32 *mip, u32 mip_top) {
     Source &src = s.src;
     const u32 flags = w[0], modes = w[7];
     const u32 tbp = w[12], tbw = w[13], tpsm = w[14];
     const u32 wms = (modes >> 24) & 3u, wmt = (modes >> 26) & 3u;
     const int owner = g_owner[(tbp / 32) & (kPages - 1)];
+    bool from_stored = false;
     ++F.lookups;
     if (owner >= 0) {
         const Target &t = *g_targets[static_cast<std::size_t>(owner)];
@@ -1018,10 +1158,82 @@ void resolve_texture(DrawState &s, const u32 *w, const u32 *mip, u32 mip_top) {
             if (t.psm == 0x00 && tpsm == 0x00) view = 0;
             else if (t.psm == 0x00 && tpsm == 0x01) view = 1;
             else if (is16(t.psm) && t.psm == tpsm) view = 2;
+            // T8H is laid out as CT32 (the index is the top byte of each word): the draw reads the target's alpha and looks it up in the
+            // palette slot of its setup (w[22]) itself. Harry Potter 2 does this ~100 times a frame (a 128x160 target, a shadow or glow
+            // mask), each of them a write-back to memory, a decode and a copy before. CT32/CT24 palettes only; PS2_HWR_T8H=0 turns it off.
+            static const bool t8h = os::env("PS2_HWR_T8H") != "0";
+            if (t8h && C.clut && t.psm == 0x00 && tpsm == 0x1B && (w[16] == 0x00 || w[16] == 0x01)) view = 3;
+        }
+        // View 4: the draw reads the target through graphics memory addresses as another format (the frame read as T8 or T4, a 16-bit target
+        // read as T8, a CT32 target read as CT16): the shader finds the target pixel that holds each texel's bits (hwr.wgsl view4), so the
+        // target is not written back to memory, decoded and copied for it. Not for mipmapped textures, a target read by a draw into itself,
+        // depth, or palettes in 16-bit formats. PS2_HWR_DIRECT=0 turns it off.
+        static const bool direct = os::env("PS2_HWR_DIRECT") != "0";
+        // PS2_HWR_DIRECT_MIP=1: a mipmapped texture is taken when its LOD can hardly leave level 0 (a fixed LOD of 0 or less, or a bias K of -4 or
+        // less), read at level 0 (counted as "mip read at level 0"). Measured in Harry Potter 2: the textures at address 0 that the game reads this
+        // way (K = -7.3, 16-28 a frame, more while a spell is cast) are mip chains it renders into the frame's corner; level 0 alone changed
+        // ~17000 pixels of far geometry, and as reads of the target being drawn they cost more as copies than as write-backs. Off.
+        static const bool direct_mip = os::env("PS2_HWR_DIRECT_MIP") == "1";  // off: those textures are mip chains the game renders itself, level 0 alone is visibly wrong
+        const u32 m0 = mip[0];
+        const int lod_k = static_cast<int>(static_cast<int32_t>(((m0 >> 16) & 0xFFFu) << 20) >> 20);  // 1/16 units
+        // a mipmapped texture: every level read through view 4 (hwr.wgsl sample_v4_mip; PS2_HWR_DIRECT_MIPMAP=0 turns it off)
+        const bool level0 = mip_top == 0 || v4_mipmaps() || (direct_mip && ((m0 & 1u) ? lod_k <= 0 : lod_k <= -64));
+        // a draw into the target it reads (PS2_HWR_DIRECT_SELF=1): a copy of the whole target per read is dearer than the old write-back of the pages read
+        // opt-in (1, nomip or mip): no gain measured (same passes and decodes as the write-back path)
+        static const std::string self_mode = os::env("PS2_HWR_DIRECT_SELF");  // 0 off, nomip: only textures without levels, mip: only mipmapped ones (test switch)
+        const bool direct_self = (self_mode == "1" || self_mode == "nomip" || self_mode == "mip") && (self_mode != "nomip" || mip_top == 0) && (self_mode != "mip" || mip_top != 0);
+        // Only for targets at the GS's own size: above it (PS2_HWR_SCALE > 1) Harry Potter 2's sun haze (a 16-bit effect buffer read as T8 at
+        // 2F20/3020) came out much weaker than through the write-back, which takes the texel under each GS pixel the same way; not understood
+        // yet, so a scaled target takes the old way (PS2_HWR_DIRECT_SCALED=1 keeps view 4 there).
+        // PS2_HWR_DIRECT_SCALED: 1 = every scaled target too, psm = scaled targets but the 16-bit (CT16S) ones, unset = none (test switch)
+        static const std::string scaled_mode = os::env("PS2_HWR_DIRECT_SCALED");
+        const bool direct_scaled = scaled_mode == "1" || (scaled_mode == "psm" && t.psm != 0x0A);
+        const bool unscaled = t.sc.x == 1.0f && t.sc.y == 1.0f;
+        if (view == 99 && direct && !g_no_view4 && (unscaled || direct_scaled) && C.clut && g_addr && !t.depth && level0 && (owner != s.color || direct_self) && (t.psm == 0x00 || t.psm == 0x02 || t.psm == 0x0A)) {
+            if (mip_top && !v4_mipmaps()) ++F.approx[kMipLevel0];
+            const bool indexed = tpsm == 0x13 || tpsm == 0x14;
+            bool ok = (indexed && (w[16] == 0x00 || w[16] == 0x01)) || tpsm == 0x02 || tpsm == 0x0A || ((tpsm == 0x00 || tpsm == 0x01) && t.psm == 0x00);
+            // Every page the texture can read must be this target's: the shader reads all its texels from this one target. Harry Potter 2's
+            // sun haze reads 2F20 as T8, whose pages are shared by the 704-wide 16-bit effect buffer and a 64-wide blur target (and memory):
+            // taken from the first page's owner alone, the haze came out at about 80 % of its brightness (garden, frame 9603).
+            static const bool all_pages = os::env("PS2_HWR_DIRECT_PAGES") == "full";
+            if (ok && all_pages) {
+                const int tw = 1 << (w[15] & 0xFFu), th = 1 << (w[15] >> 8);
+                std::string owners;
+                static const bool log_owners = os::env("PS2_HWR_LOG") == "6";
+                for_pages(tpsm, tbp, tbw, 0, 0, tw - 1, th - 1, [&](u32 page) {
+                    const int o = g_owner[page & (kPages - 1)];
+                    if (o != owner) ok = false;
+                    if (log_owners) owners += std::to_string(page) + ":" + std::to_string(o) + " ";
+                });
+                if (log_owners && !ok) {
+                    static int n = 0;
+                    if (n++ < 6) std::fprintf(stderr, "[hwr-owners] tex %04X/%u psm %02X %dx%d owner t%d (bp %04X bw %u psm %02X %ux%u): %s\n", tbp, tbw, tpsm, tw, th, owner, t.bp, t.bw, t.psm, t.w, t.h, owners.c_str());
+                }
+            }
+            if (ok) view = 4;
         }
         if (view == 99) {
-            fail(s, kTexTarget);
-            return;
+            // PS2_HWR_LOG=2: which target/texture format pairs end here (target bp/bw/psm and the texture's tbp/tbw/tpsm, with how many shapes)
+            static const bool log_pairs = os::env("PS2_HWR_LOG") == "2";
+            if (log_pairs) {
+                static std::unordered_map<u64, u32> seen;
+                const u64 key = (static_cast<u64>(t.bp) << 40) ^ (static_cast<u64>(t.bw) << 32) ^ (static_cast<u64>(t.psm) << 24) ^ (static_cast<u64>(t.depth) << 23) ^
+                                (static_cast<u64>(tbp) << 12) ^ (static_cast<u64>(tbw) << 6) ^ tpsm;
+                const u32 n = ++seen[key];
+                if (n == 1 || n == 1000 || n == 100000)
+                    std::fprintf(stderr, "[hwr-pair] target bp %04X bw %u psm %02X%s (%ux%u) read as texture tbp %04X tbw %u tpsm %02X (shape count so far %u)\n", t.bp, t.bw, t.psm,
+                                 t.depth ? " DEPTH" : "", t.w, t.h, tbp, tbw, tpsm, n);
+            }
+            static const bool no_store = os::env("PS2_HWR_NOSTORE") == "1";
+            if (no_store) {
+                fail(s, kTexTarget);
+                return;
+            }
+            static const bool stale_self = os::env("PS2_HWR_STALE_SELF") != "0";
+            store_for_memory(owner, tbp, tbw, tpsm, w[15] & 0xFFu, w[15] >> 8, stale_self && owner == s.color);
+            from_stored = true;
+            goto from_memory;
         }
         ++F.target_reads;
         src.kind = 2;
@@ -1032,6 +1244,7 @@ void resolve_texture(DrawState &s, const u32 *w, const u32 *mip, u32 mip_top) {
         s.self_read = owner == s.color;
         return;
     }
+from_memory:
     bool stale = false;
     const u64 key = texture_key(w, mip, mip_top, stale);
     if (stale) ++F.approx[kStaleTex];
@@ -1041,8 +1254,18 @@ void resolve_texture(DrawState &s, const u32 *w, const u32 *mip, u32 mip_top) {
         ++F.hits;
     } else {
         e = decode_texture(key, w, mip, mip_top);
+        // PS2_HWR_LOG=4: every texture decoded (a cache miss) with what it is, to see why a frame decodes what it decodes
+        static const bool log_miss = os::env("PS2_HWR_LOG") == "4";
+        if (log_miss)
+            std::fprintf(stderr, "[hwr-miss] frame %llu tbp %04X tbw %u tpsm %02X %ux%u levels %u cbp %04X cpsm %02X%s%s\n", static_cast<unsigned long long>(g_frames), w[12], w[13], w[14],
+                         1u << (w[15] & 0xFFu), 1u << (w[15] >> 8), e->levels, w[16] & 0x3FFFu, (w[16] >> 14) & 0x3Fu, from_stored ? " FROM-TARGET" : "", stale ? " STALE" : "");
+        if (log_miss)
+            std::fprintf(stderr, "[hwr-miss-mip] mip0 %08X flags %05X modes %08X top %u levels %04X/%u %04X/%u %04X/%u owner %d color %d page owners %d %d %d\n", mip[0], w[0], w[7], mip_top,
+                         mip[1] & 0x3FFFu, (mip[1] >> 14) & 0x3Fu, mip[2] & 0x3FFFu, (mip[2] >> 14) & 0x3Fu, mip[3] & 0x3FFFu, (mip[3] >> 14) & 0x3Fu, owner, s.color,
+                         g_owner[(mip[1] & 0x3FFFu) / 32 & (kPages - 1)], g_owner[(mip[2] & 0x3FFFu) / 32 & (kPages - 1)], g_owner[(mip[3] & 0x3FFFu) / 32 & (kPages - 1)]);
     }
     e->last_frame = g_frames;
+    if (from_stored) e->transient = true;
     const bool manual = wms >= 2 || wmt >= 2;
     if (manual && e->levels > 1) ++F.approx[kRegionMip];
     u32 si = 0;
@@ -1069,7 +1292,16 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     s.color = s.depth = -1;
     const u32 flags = w[0], fbp = w[1], fbw = w[2], fpsm = w[3], fbmsk = w[4], zbp = w[5], zpsm = w[6], modes = w[7];
     if (prim < 3) return fail(s, kPrimKind);
-    if (flags & 128u) return fail(s, kDate);
+    if (flags & 128u) {
+        static const bool log_date = os::env("PS2_HWR_LOG") == "3";
+        if (log_date) {
+            static std::unordered_map<u32, u32> seen;
+            const u32 key = fpsm | (modes & 0xFF) << 8 | (flags & 0xFFFFu) << 16;
+            const u32 n = ++seen[key];
+            if (n == 1 || n == 1000 || n == 100000) std::fprintf(stderr, "[hwr-date] fpsm %02X DATM %u flags %05X modes %08X zte %d (count %u)\n", fpsm, (modes >> 20) & 1u, flags, modes, (flags & 512u) ? 1 : 0, n);
+        }
+        return fail(s, kDate);
+    }
     if (fpsm != 0x00 && fpsm != 0x01 && fpsm != 0x02 && fpsm != 0x0A) return fail(s, kFramePsm);
     if (fbw == 0) return fail(s, kZeroWidth);
     const bool zte = flags & 512u;
@@ -1114,7 +1346,17 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
         bool ok;
         const bool alpha_written = (pass_mask | fail_mask) & 8u;
         blend_map(A, B, Cc, Dd, C.dual, alpha_written, base, uses_as, ok, premul);
-        if (!ok) return fail(s, Cc == 0 && !C.dual ? kNoDual : kBlend);
+        if (!ok) {
+            static const bool log_blend = os::env("PS2_HWR_LOG") == "3";   // PS2_HWR_LOG=3: the blend forms (A B C D) and formats that are not drawn, with counts
+            if (log_blend) {
+                static std::unordered_map<u32, u32> seen;
+                const u32 key = A | B << 2 | Cc << 4 | Dd << 6 | fpsm << 8 | (alpha_written ? 1u << 16 : 0u) | (w[9] & 0xFFu) << 17;
+                const u32 n = ++seen[key];
+                if (n == 1 || n == 1000 || n == 100000)
+                    std::fprintf(stderr, "[hwr-blend] A %u B %u C %u D %u fix %02X fpsm %02X alpha written %d (count %u)\n", A, B, Cc, Dd, w[9] & 0xFFu, fpsm, alpha_written ? 1 : 0, n);
+            }
+            return fail(s, Cc == 0 && !C.dual ? kNoDual : kBlend);
+        }
         if (!(flags & 2048u)) ++F.approx[kColclamp];
         base.dual = uses_as && C.dual;
     }
@@ -1124,11 +1366,19 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     // buffer of a field game holds 256 rows, its frame 384, and every card texel of a render pass is loaded and stored by a tile GPU
     // whether it is drawn or not. A later draw below it makes it 512 rows (grow()).
     static const bool full_height = os::env("PS2_HWR_FULL_HEIGHT") == "1";
-    const u32 used = std::clamp<u32>((w[11] >> 16) + 1u, 64u, 512u);
-    const u32 W = std::max<u32>(64, fbw * 64), H = full_height ? 512u : std::min<u32>(512u, (used + 31u) & ~31u);
+    // At most kMaxRows (576): a PAL game's whole frame (Harry Potter 2 draws 704 x 576 and shrinks it into its 640 x 512 display buffer; at 512
+    // rows its bottom 64 were missing and the shrink repeated the last row over the display's rows 456-511)
+    const u32 used = std::clamp<u32>((w[11] >> 16) + 1u, 64u, kMaxRows);
+    const u32 W = std::max<u32>(64, fbw * 64), H = full_height ? std::max(512u, (used + 31u) & ~31u) : std::min<u32>(kMaxRows, (used + 31u) & ~31u);
     const u32 cclass = is16(fpsm) ? fpsm : 0x00;
     Sc csc = base_scale(W);
     if (g_rows > 0.0f && W >= kSmallWidth) csc.y = std::min(csc.y, g_rows / static_cast<float>(used));
+    // 16-bit colour targets stay at the GS's own size (PS2_HWR_NATIVE16=0: scaled like the others). Games read them back as other formats
+    // (Harry Potter 2's sun haze: a 704-wide CT16S buffer read as T8, each pixel's bytes palette indices), where an upscaled picture's
+    // slightly different values pick other palette entries: at 2x the haze came out at 52 against 62.6 in the reference renderer. They are
+    // effect buffers (blurred on screen anyway), so 1x is also less card work.
+    static const bool native16 = os::env("PS2_HWR_NATIVE16") != "0";
+    if (native16 && cclass != 0x00) csc = Sc{1.0f, 1.0f};
     s.color = find_target(fbp, fbw, cclass, false, W, H, csc);
     g_targets[static_cast<std::size_t>(s.color)]->last_psm = fpsm;
     s.zmax = w[23];
@@ -1152,6 +1402,7 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
         }
     }
     s.cwrite_any = (pass_mask | fail_mask) != 0;
+    s.awrite_any = ((pass_mask | fail_mask) & 8u) != 0;
     s.zwrite_any = pass_z || fail_z;
     s.color_full = pass_mask == (fpsm == 0x01 ? 7u : 15u) && split == 0;
     // texture
@@ -1171,7 +1422,7 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     if (flags & 32768u) f |= 32u;
     if (flags & 4096u) f |= 64u;
     if (is16(fpsm)) f |= 128u;
-    if (s.src.kind == 1 && mip[0]) f |= 256u;
+    if ((s.src.kind == 1 || (s.src.view == 4 && mip_top)) && mip[0]) f |= 256u;  // F_MIP: the decoded texture's levels, or view 4's (sample_v4_mip)
     if (uses_as && !C.dual) f |= 512u;
     if (premul) f |= premul == 1 ? 1024u : 2048u;
     if (is16(fpsm) && (!base.blend || premul)) f |= premul == 2 ? 8192u : 4096u;
@@ -1187,9 +1438,31 @@ void build_state(DrawState &s, const State &st, const u32 *w, const u32 *mip, u3
     p[9] = s.src.levels ? s.src.levels - 1 : 0;
     p[10] = w[9];  // FIX
     const Sc src_sc = s.src.kind == 2 && s.src.target >= 0 ? g_targets[static_cast<std::size_t>(s.src.target)]->sc : Sc{};
-    const bool scaled = src_sc.x != 1.0f || src_sc.y != 1.0f;
+    const bool scaled = (src_sc.x != 1.0f || src_sc.y != 1.0f) && s.src.view != 4;  // view 4 reads GS texels and scales them itself
     p[11] = scaled ? fbits(src_sc.x) : 0u;  // a target source: its card texels per GS texel across and down (f32 bits; 0 = not scaled)
     p[12] = scaled ? fbits(src_sc.y) : 0u;
+    // T8H from a target: the palette slot (PS2_HWR_T8H=mark: a test aid, those texels are drawn magenta to see where they are)
+    static const bool t8h_mark = os::env("PS2_HWR_T8H") == "mark";
+    // PS2_HWR_LOG=5: where the draws that read a target as T8H (view 3) or through memory addresses (view 4) write, once per kind
+    static const bool log_view = os::env("PS2_HWR_LOG") == "5";
+    if (log_view && s.src.view >= 3) {
+        static std::unordered_map<u64, u32> seen;
+        const Target &dt = *g_targets[static_cast<std::size_t>(s.color)];
+        const u64 key = static_cast<u64>(s.src.view) | static_cast<u64>(dt.bp) << 4 | static_cast<u64>(fbmsk) << 20 | static_cast<u64>(flags & 0xFFFFu) << 52;
+        if (++seen[key] == 1)
+            std::fprintf(stderr, "[hwr-view] view %u reads target %d (bp %04X psm %02X) as tpsm %02X, writes target bp %04X psm %02X %ux%u fbmsk %08X flags %05X modes %08X\n", s.src.view,
+                         s.src.target, g_targets[static_cast<std::size_t>(s.src.target)]->bp, g_targets[static_cast<std::size_t>(s.src.target)]->psm, w[14], dt.bp, dt.psm, dt.w, dt.h, fbmsk, flags, modes);
+    }
+    p[13] = s.src.view == 3 ? (t8h_mark ? 0xFFFFFFFFu : w[22]) : 0u;
+    if (s.src.view == 4) {  // view 4: the palette slot and CSA, the texture's and the target's base, width and format, the target's scale
+        const Target &st4 = *g_targets[static_cast<std::size_t>(s.src.target)];
+        static const bool v4_mark = os::env("PS2_HWR_DIRECT") == "mark";
+        p[13] = v4_mark ? 0xFFFFFFFFu : (w[22] & 0x7FFu) | (w[17] & 31u) << 11;
+        p[14] = (w[12] & 0x3FFFu) | (w[13] & 63u) << 14 | (w[14] & 63u) << 20;
+        p[15] = (st4.bp & 0x3FFFu) | (st4.bw & 63u) << 14 | (st4.psm & 63u) << 20;
+        p[12] = fbits(src_sc.x);
+        p[9] = fbits(src_sc.y);
+    }
     // pipelines
     const u32 tk = s.src.kind == 1 ? 1u : s.src.kind == 2 ? 2u : 0u;
     PipeKey k = base;
@@ -1234,28 +1507,175 @@ void ensure_pass(DrawState &s) {
 }
 
 // what a shape drew into a target: a draw that reads a copy of the target made before this is out of date where they overlap
-void note_write(Target &t, int x0, int y0, int x1, int y1) {
+void add_dirty(std::vector<Rect> &list, const Rect &r) {
+    // A rectangle that continues one already listed (the same columns and the next rows, or the same rows and the next columns) grows it: a
+    // game that moves a picture by a strip at a time (Harry Potter 2 shifts its 704x512 effect buffer up 2 rows with 1408 strips of 64x2)
+    // keeps one rectangle per column, where the bounding box of everything used to cover rows not written yet and force a copy per column.
+    // PS2_HWR_DIRTY_MERGE=0 turns it off.
+    static const bool merge = os::env("PS2_HWR_DIRTY_MERGE") != "0";
+    if (merge)
+        for (Rect &d : list) {
+            if (d.x0 == r.x0 && d.x1 == r.x1 && r.y0 <= d.y1 + 1 && d.y0 <= r.y1 + 1) {
+                d.y0 = std::min(d.y0, r.y0), d.y1 = std::max(d.y1, r.y1);
+                return;
+            }
+            if (d.y0 == r.y0 && d.y1 == r.y1 && r.x0 <= d.x1 + 1 && d.x0 <= r.x1 + 1) {
+                d.x0 = std::min(d.x0, r.x0), d.x1 = std::max(d.x1, r.x1);
+                return;
+            }
+        }
+    if (merge && list.size() >= 32) {
+        // full: rectangles over the same columns become one first (a column of strips), so that the rest keep their own places
+        std::vector<Rect> grouped;
+        for (const Rect &d : list) {
+            bool joined = false;
+            for (Rect &g : grouped)
+                if (g.x0 == d.x0 && g.x1 == d.x1) {
+                    g.y0 = std::min(g.y0, d.y0), g.y1 = std::max(g.y1, d.y1);
+                    joined = true;
+                    break;
+                }
+            if (!joined) grouped.push_back(d);
+        }
+        list.swap(grouped);
+    }
+    if (list.size() >= 32) {
+        Rect &b = list[0];
+        for (const Rect &d : list) b.x0 = std::min(b.x0, d.x0), b.y0 = std::min(b.y0, d.y0), b.x1 = std::max(b.x1, d.x1), b.y1 = std::max(b.y1, d.y1);
+        list.resize(1);
+    }
+    list.push_back(r);
+}
+
+void note_write(Target &t, int x0, int y0, int x1, int y1, bool alpha) {
+    ++t.writes;
     if (!t.snap) return;
     const Rect r{x0, y0, x1, y1};
-    if (t.dirty.size() >= 32) {
-        Rect &b = t.dirty[0];
-        for (const Rect &d : t.dirty) b.x0 = std::min(b.x0, d.x0), b.y0 = std::min(b.y0, d.y0), b.x1 = std::max(b.x1, d.x1), b.y1 = std::max(b.y1, d.y1);
-        t.dirty.resize(1);
-    }
-    t.dirty.push_back(r);
+    add_dirty(t.dirty, r);
+    if (alpha) add_dirty(t.dirty_a, r);
 }
 
 // a draw that reads the target it draws into reads a copy of it, made before the draw (outside the render pass). The copy is made again only
 // when something was drawn into the rectangle the draw reads since the last copy (the glow ladder reads one part and writes another).
-WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res) {
+// alpha_only: the draw reads only the copy's alpha (a T8H palette conversion, view 3, that writes the colour of the same target with its
+// alpha masked: Harry Potter 2 draws ~200 of them a frame). Writes that left alpha alone do not make the copy old for it, so the draws
+// share one copy and one render pass instead of a copy and a pass break each. PS2_HWR_ALPHA_SNAP=0 turns it off.
+WGPUBindGroup self_copy(int ti, const Rect &r, u64 &res, bool alpha_only, bool frame_stale = false) {
     Target &t = *g_targets[static_cast<std::size_t>(ti)];
+    static const bool alpha_snap = os::env("PS2_HWR_ALPHA_SNAP") != "0";
+    // frame_stale (a view-4 read of the target being drawn, r page-aligned): page by page as the write-back path reads its target
+    // (store_for_memory once_per_frame): a page's part of the copy is brought up to date at its first read in a frame and read as it is for
+    // the rest of that frame (counted "own target read as of earlier in the frame")
+    if (frame_stale) {
+        u32 pw, ph;
+        page_dims(t.psm, pw, ph);
+        const u32 per_row = std::max<u32>(1, t.w / pw), rows = (t.h + ph - 1) / ph;
+        if (t.page_snap_frame.size() != static_cast<std::size_t>(per_row) * rows) t.page_snap_frame.assign(static_cast<std::size_t>(per_row) * rows, 0);
+        const bool have = t.snap && t.snap_of == t.s;
+        if (!have) {  // a new copy of the whole picture as it is now; its pages count as brought up to date when they are first read
+            drop_snap(t);
+            t.snap = get_surf(t.w, t.h, false, t.sc);
+            t.snap_of = t.s;
+            Op &op = add_op(kOpSelfCopy);
+            op.tex = t.s->tex;
+            op.tex2 = t.snap->tex;
+            op.w = t.w, op.h = t.h;
+            op.sc = t.sc;
+            op.rd = t.s->id;
+            op.wr = t.snap->id;
+            op.tgt = ti;
+            ++F.self_copies;
+            F.copy_bytes += static_cast<u64>(card_x(t.w, t.sc)) * card_y(t.h, t.sc) * 4;
+            t.dirty.clear(), t.dirty_a.clear();
+            std::fill(t.page_snap_frame.begin(), t.page_snap_frame.end(), 0);
+        }
+        bool stale = false;
+        const int x0 = std::max(r.x0, 0), y0 = std::max(r.y0, 0);
+        const int x1 = std::min(r.x1, static_cast<int>(per_row * pw) - 1), y1 = std::min(r.y1, static_cast<int>(rows * ph) - 1);
+        for (int py = y0 / static_cast<int>(ph); py <= y1 / static_cast<int>(ph); ++py)
+            for (int px = x0 / static_cast<int>(pw); px <= x1 / static_cast<int>(pw); ++px) {
+                u64 &f = t.page_snap_frame[static_cast<std::size_t>(py) * per_row + static_cast<std::size_t>(px)];
+                if (f == g_frames + 1) {
+                    stale = true;
+                    continue;
+                }
+                f = g_frames + 1;
+                if (!have) continue;  // the whole copy just made holds it as it is now
+                const u32 gx = static_cast<u32>(px) * pw, gy = static_cast<u32>(py) * ph;
+                const u32 cx0 = card_at_x(gx, t.sc), cy0 = card_at_y(gy, t.sc);
+                const u32 cx1 = std::min(card_at_x(gx + pw, t.sc), card_x(t.w, t.sc)), cy1 = std::min(card_at_y(gy + ph, t.sc), card_y(t.h, t.sc));
+                if (cx1 <= cx0 || cy1 <= cy0) continue;
+                Op &op = add_op(kOpSelfCopy);
+                op.tex = t.s->tex;
+                op.tex2 = t.snap->tex;
+                op.level = 1;
+                op.offset = cx0, op.pitch = cy0;
+                op.w = cx1 - cx0, op.h = cy1 - cy0;
+                op.sc = t.sc;
+                op.rd = t.s->id;
+                op.wr = t.snap->id;
+                op.tgt = ti;
+                ++F.self_copies;
+                F.copy_bytes += static_cast<u64>(op.w) * op.h * 4;
+            }
+        if (stale) ++F.approx[kStaleSelf];
+        res = t.snap->id;
+        return t.snap->sample_group;
+    }
     bool fresh = t.snap && t.snap_of == t.s;
     if (fresh)
-        for (const Rect &d : t.dirty)
+        for (const Rect &d : alpha_only && alpha_snap ? t.dirty_a : t.dirty)
             if (d.hits(r)) {
                 fresh = false;
                 break;
             }
+    // A copy that exists already is brought up to date only where the draw reads (the rectangle r): Harry Potter 2 shifts its 704x512 effect
+    // buffer with a draw per 64-pixel column that reads the column before, a whole copy per column before (15 MB a frame). Written rectangles
+    // that lie inside r are no longer dirty; the others stay (they still differ from the copy). PS2_HWR_PARTIAL_COPY=0 turns it off.
+    static const bool partial = os::env("PS2_HWR_PARTIAL_COPY") != "0";
+    const int vw = std::clamp<int>(t.valid_w, 1, static_cast<int>(t.w)), vh = std::clamp<int>(t.valid_h, 1, static_cast<int>(t.h));
+    Rect pr{std::max(r.x0, 0), std::max(r.y0, 0), std::min(r.x1, vw - 1), std::min(r.y1, vh - 1)};
+    // the part copied reaches over all the rows of the written rectangles it meets, so that they can be cut back to what lies beside it
+    // (one copy for a column of strips, not one per strip)
+    if (!fresh && partial)
+        for (const Rect &d : alpha_only && alpha_snap ? t.dirty_a : t.dirty)
+            if (d.hits(pr)) pr.y0 = std::max(0, std::min(pr.y0, d.y0)), pr.y1 = std::min(vh - 1, std::max(pr.y1, d.y1));
+    if (!fresh && partial && t.snap && t.snap_of == t.s && pr.x0 <= pr.x1 && pr.y0 <= pr.y1 &&
+        static_cast<long>(pr.x1 - pr.x0 + 1) * (pr.y1 - pr.y0 + 1) * 2 < static_cast<long>(vw) * vh) {
+        const u32 cx0 = card_at_x(static_cast<u32>(pr.x0), t.sc), cy0 = card_at_y(static_cast<u32>(pr.y0), t.sc);
+        const u32 cx1 = std::min(card_at_x(static_cast<u32>(pr.x1 + 1), t.sc), card_x(t.w, t.sc)), cy1 = std::min(card_at_y(static_cast<u32>(pr.y1 + 1), t.sc), card_y(t.h, t.sc));
+        if (cx1 > cx0 && cy1 > cy0) {
+            Op &op = add_op(kOpSelfCopy);
+            op.tex = t.s->tex;
+            op.tex2 = t.snap->tex;
+            op.level = 1;  // a part: offset, pitch are its card origin, w, h its card size
+            op.offset = cx0, op.pitch = cy0;
+            op.w = cx1 - cx0, op.h = cy1 - cy0;
+            op.sc = t.sc;
+            op.rd = t.s->id;
+            op.wr = t.snap->id;
+            op.tgt = ti;
+            ++F.self_copies;
+            F.copy_bytes += static_cast<u64>(op.w) * op.h * 4;
+            const auto inside = [&](const Rect &d) { return d.x0 >= pr.x0 && d.x1 <= pr.x1 && d.y0 >= pr.y0 && d.y1 <= pr.y1; };
+            t.dirty.erase(std::remove_if(t.dirty.begin(), t.dirty.end(), inside), t.dirty.end());
+            t.dirty_a.erase(std::remove_if(t.dirty_a.begin(), t.dirty_a.end(), inside), t.dirty_a.end());
+            // what is left of a written rectangle that reaches into r: its part outside r is enough (cut along the side it crosses)
+            for (std::vector<Rect> *list : {&t.dirty, &t.dirty_a})
+                for (Rect &d : *list) {
+                    if (!d.hits(pr)) continue;
+                    if (d.y0 >= pr.y0 && d.y1 <= pr.y1) {  // spans r's rows: keep the columns outside r on one side
+                        if (d.x0 < pr.x0 && d.x1 <= pr.x1) d.x1 = pr.x0 - 1;
+                        else if (d.x1 > pr.x1 && d.x0 >= pr.x0) d.x0 = pr.x1 + 1;
+                    } else if (d.x0 >= pr.x0 && d.x1 <= pr.x1) {  // spans r's columns: keep the rows outside r on one side
+                        if (d.y0 < pr.y0 && d.y1 <= pr.y1) d.y1 = pr.y0 - 1;
+                        else if (d.y1 > pr.y1 && d.y0 >= pr.y0) d.y0 = pr.y1 + 1;
+                    }
+                }
+            res = t.snap->id;
+            return t.snap->sample_group;
+        }
+    }
     if (!fresh) {
         drop_snap(t);
         t.snap = get_surf(t.w, t.h, false, t.sc);
@@ -1344,6 +1764,32 @@ u32 add_params(const std::array<u32, 16> &p) {
     return static_cast<u32>(g_params.size() - 1);
 }
 
+// a mipmapped view-4 draw: its record and, right after it, the record of its levels 1..6 (base | width << 14) and its top level (word 6)
+// that hwr.wgsl sample_v4_mip reads (never shared with the record before: the shader takes the next record as the levels)
+u32 add_mip_record(const std::array<u32, 16> &p, const u32 *mip, u32 mip_top, u32 mem_mask = 0) {
+    g_params.push_back(p);
+    std::array<u32, 16> x{};
+    for (int n = 1; n <= 6; ++n) x[static_cast<std::size_t>(n - 1)] = mip[n];
+    x[6] = mip_top;
+    x[7] = mem_mask;  // bit n: level n from graphics memory (hwr.wgsl from_mem)
+    g_params.push_back(x);
+    return static_cast<u32>(g_params.size() - 2);
+}
+
+// PS2_HWR_DIRECT_MIPMAP=1: mipmapped textures are read through view 4 too (otherwise written back, decoded and copied level by level)
+bool v4_mipmaps() {
+    // opt-in (PS2_HWR_DIRECT_MIPMAP=1): measured in Harry Potter 2 (docs/debugging-native.md): the spell sparkles' lower levels lie in memory that the game
+    // uploads again between draws, so no exact gain; levels inside the target are read exactly
+    static const bool on = os::env("PS2_HWR_DIRECT_MIPMAP") == "1";
+    return on;
+}
+
+u32 shape_params(const DrawState &s, const u32 *mip, u32 mip_top) {
+    if (s.skip) return 0u;
+    if (s.src.view == 4 && mip_top && mip[0]) return add_mip_record(s.pw, mip, mip_top);
+    return add_params(s.pw);
+}
+
 // a run of clear strips being drawn (shape(): becomes a clear of the target when it covers it)
 struct ClearRun {
     bool on = false, zw = false, tex = false;
@@ -1378,6 +1824,7 @@ void timer_init();
 
 bool init(const Context &ctx) {
     C = ctx;
+    if (os::env("PS2_HWR_NODUAL") == "1") C.dual = false;   // test aid: the device behaves as one without dual-source blending (the Mali phones)
     g_s = std::max<u32>(ctx.scale, 1u);
     g_fx = ctx.target_scale > 0.0f ? std::clamp(ctx.target_scale, 0.25f, 6.0f) : static_cast<float>(g_s);
     const float fy = static_cast<float>(std::atof(os::env("PS2_HWR_SCALE_Y").c_str()));
@@ -1425,7 +1872,33 @@ bool init(const Context &ctx) {
         // OpenGL ES on Mali has no storage buffers in vertex shaders: there the fragment stage reads the records (vs_gl, fs_gl)
         e.visibility = C.gl ? WGPUShaderStage_Fragment : WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
         e.buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
-        g_params_layout = make_layout(&e, 1);
+        // binding 1: the palettes, for a CT32 target read as T8H straight from the target (view 3) and view 4; binding 2: the address tables (view 4)
+        // binding 3: graphics memory, for the mip levels of a view-4 read that memory holds (sample_v4_mip)
+        WGPUBindGroupLayoutEntry pe[4] = {e, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+        pe[1].binding = 1;
+        pe[1].visibility = WGPUShaderStage_Fragment;
+        pe[1].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+        pe[2] = pe[1];
+        pe[2].binding = 2;
+        pe[3] = pe[1];
+        pe[3].binding = 3;
+        g_params_layout = make_layout(pe, 4);
+        std::vector<u32> at(kAddrWords, 0);
+        if (C.swizzle && C.swizzle_size >= kInv32) {
+            std::copy(C.swizzle, C.swizzle + kInv32, at.begin());
+            for (u32 y = 0; y < 32; ++y)
+                for (u32 x = 0; x < 64; ++x) at[kInv32 + (C.swizzle[0 + y * 64 + x] & 8191u) / 4] = x | y << 8;
+            for (u32 y = 0; y < 64; ++y)
+                for (u32 x = 0; x < 64; ++x) {
+                    at[kInv16 + (C.swizzle[4096 + y * 64 + x] & 8191u) / 2] = x | y << 8;
+                    at[kInv16S + (C.swizzle[8192 + y * 64 + x] & 8191u) / 2] = x | y << 8;
+                }
+        }
+        WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+        bd.size = static_cast<u64>(kAddrWords) * 4;
+        bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+        g_addr = wgpuDeviceCreateBuffer(C.device, &bd);
+        wgpuQueueWriteBuffer(C.queue, g_addr, 0, at.data(), bd.size);
     }
     {
         WGPUBindGroupLayoutEntry e[6] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
@@ -1537,20 +2010,106 @@ bool init(const Context &ctx) {
 
 void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 serial, const Vertex *v, int count) {
     const auto t0 = g_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};  // timed for PS2_HWR_LOG only: two clock reads per shape cost ~1 ms per frame on a phone
+    const prof::Scope shape_scope(prof::kRShape);
     ++F.shapes;
+    if (prov::g_on) prov::count(prov::kShapes);
     const u32 prim = static_cast<u32>(st.prim) & 7u;
     DrawState &s = g_ds;
     if (s.serial != serial || s.epoch != g_epoch || s.submit != g_submit) {
+        ++F.builds;
+        if (s.serial == serial && s.submit == g_submit) ++F.builds_epoch;
+        const auto b0 = g_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const prof::Scope build_scope(prof::kRBuild);
         build_state(s, st, w, mip, mip_top, prim);
+        if (g_log) F.build_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count();
         s.serial = serial;
         s.epoch = g_epoch;
         s.submit = g_submit;
-        s.param = s.skip ? 0u : add_params(s.pw);
+        s.param = shape_params(s, mip, mip_top);
         s.sc[0] = static_cast<int>(w[10] & 0xFFFFu), s.sc[2] = static_cast<int>(w[10] >> 16);
         s.sc[1] = static_cast<int>(w[11] & 0xFFFFu), s.sc[3] = static_cast<int>(w[11] >> 16);
     }
+    // A view-4 draw reads every texel from one target (the owner of the texture's first page). The texels this draw reads must all lie in
+    // pages that target holds; otherwise (Harry Potter 2's sun haze: a 1408-wide T8 view over a 704-wide 16-bit buffer, whose further
+    // pages belong to the frame, a blur target and memory) this one draw is set up again the old way (write-back and decode).
+    // PS2_HWR_DIRECT_PAGES=0: no check (the earlier behaviour).
+    static const bool view4_pages = os::env("PS2_HWR_DIRECT_PAGES") != "0";
+    if (view4_pages && s.src.view == 4 && s.src.target >= 0) {
+        const Rect tr = read_rect(w, v, std::min(count, prim == 6 ? 2 : 3), 1 << (w[15] & 0xFFu), 1 << (w[15] >> 8));
+        bool inside = true;
+        for_pages(w[14], w[12], w[13], tr.x0, tr.y0, tr.x1, tr.y1, [&](u32 page) {
+            if (g_owner[page & (kPages - 1)] != s.src.target) inside = false;
+        });
+        // A mipmapped read: the same rectangle at every level (halved per level), in that level's base and width. Unless the draw cannot leave
+        // level 0: the largest LOD its corners give (the GS's LOD = log2(1/q) * 2^L + K, or K alone with LCM; 1/q over a shape stays between
+        // its corners' values) is 0 or less, so the shader reads level 0 (magnification) only. Harry Potter 2's spell sparkles: K = -7.9, their
+        // level 1 base points into memory the frame does not hold.
+        bool needs_levels = mip_top && mip[0];
+        if (needs_levels) {
+            const u32 m = mip[0];
+            const float k = static_cast<float>(static_cast<int32_t>(((m >> 16) & 0xFFFu) << 20) >> 20) / 16.0f;
+            float lod_max = k;
+            if (!(m & 1u) && !(w[0] & 16u)) {  // per pixel, from q (a shape with u, v coordinates has q = 1)
+                float qmin = 1e30f;
+                for (int i = 0; i < std::min(count, prim == 6 ? 2 : 3); ++i) qmin = std::min(qmin, std::fabs(v[i].q));
+                lod_max = qmin > 0.0f ? std::log2(1.0f / qmin) * static_cast<float>(1u << ((m >> 8) & 3u)) + k : 1e9f;
+            }
+            if (lod_max <= -0.01f) needs_levels = false;  // a margin: the shader's LOD per pixel is the same sum in float
+        }
+        // Each level is the target's (all its pages held by it) or graphics memory's (all its pages held by nobody and up to date there:
+        // indexed formats, PS2_SCALE 1); a level split between them sets the draw up the old way.
+        u32 mem_mask = 0;
+        static const bool mem_levels = os::env("PS2_HWR_DIRECT_MEMLEVELS") == "1";  // opt-in, NOT exact: a level that memory holds is read when the pass runs, after the game's later uploads
+        const bool mem_ok = mem_levels && C.vram && g_s == 1 && (w[14] == 0x13 || w[14] == 0x14);
+        if (needs_levels)
+            for (u32 n = 1; n <= mip_top && inside; ++n) {
+                bool all_target = true, all_memory = true;
+                for_pages(w[14], mip[n] & 0x3FFFu, (mip[n] >> 14) & 0x3Fu, tr.x0 >> n, tr.y0 >> n, tr.x1 >> n, tr.y1 >> n, [&](u32 page) {
+                    const u32 pg = page & (kPages - 1);
+                    if (g_owner[pg] != s.src.target) all_target = false;
+                    if (g_owner[pg] != -1 || g_page_stale[pg]) all_memory = false;
+                });
+                if (all_target) continue;
+                if (all_memory && mem_ok) {
+                    mem_mask |= 1u << n;
+                    for_pages(w[14], mip[n] & 0x3FFFu, (mip[n] >> 14) & 0x3Fu, tr.x0 >> n, tr.y0 >> n, tr.x1 >> n, tr.y1 >> n, [&](u32 page) { g_mem_read_submit[page & (kPages - 1)] = g_submit; });
+                }
+                else inside = false;
+            }
+        // a draw that reads levels from memory: a record pair of its own carrying which (the shader's from_mem); the pair the state made is
+        // shared by the shapes that follow with other rectangles
+        if (inside && mem_mask) {
+            s.param = add_mip_record(s.pw, mip, mip_top, mem_mask);
+            static const bool log_mem = os::env("PS2_HWR_LOG") == "6";
+            static int nlog = 0;
+            if (log_mem && nlog++ < 40)
+                std::fprintf(stderr, "[hwr-v4-mem] frame %llu tex %04X/%u psm %02X rect %d,%d-%d,%d mem levels %02X top %u mip0 %08X fst %d color t%d (bp %04X psm %02X) lv1 %04X/%u lv2 %04X/%u lv3 %04X/%u\n",
+                             static_cast<unsigned long long>(g_frames), w[12], w[13], w[14], tr.x0, tr.y0, tr.x1, tr.y1, mem_mask, mip_top, mip[0], (w[0] & 16u) ? 1 : 0, s.color,
+                             g_targets[static_cast<std::size_t>(s.color)]->bp, g_targets[static_cast<std::size_t>(s.color)]->psm, mip[1] & 0x3FFFu, (mip[1] >> 14) & 63u, mip[2] & 0x3FFFu,
+                             (mip[2] >> 14) & 63u, mip[3] & 0x3FFFu, (mip[3] >> 14) & 63u);
+        }
+        if (!inside) {
+            static const bool log_out = os::env("PS2_HWR_LOG") == "6";
+            if (log_out) {
+                static int n = 0;
+                if (n++ < 30) {
+                    std::string owners;
+                    for_pages(w[14], w[12], w[13], tr.x0, tr.y0, tr.x1, tr.y1, [&](u32 page) { owners += std::to_string(page) + ":" + std::to_string(g_owner[page & (kPages - 1)]) + " "; });
+                    std::fprintf(stderr, "[hwr-v4-out] tex %04X/%u psm %02X rect %d,%d-%d,%d src t%d color t%d fst %d mip_top %u lod-needs %d pages %s\n", w[12], w[13], w[14], tr.x0, tr.y0, tr.x1, tr.y1,
+                                 s.src.target, s.color, (w[0] & 16u) ? 1 : 0, mip_top, needs_levels ? 1 : 0, owners.c_str());
+                }
+            }
+            ++F.view4_out;
+            g_no_view4 = true;
+            build_state(s, st, w, mip, mip_top, prim);
+            g_no_view4 = false;
+            s.param = shape_params(s, mip, mip_top);
+            s.epoch = 0;  // the next shape is set up again (with view 4 if its texels allow it)
+        }
+    }
     if (s.skip == 2) {
         ++F.fallback[s.reason];
+        if (prov::g_on) prov::drop(kReasonName[s.reason]);
         return;
     }
     // PS2_HWR_SKIP_TBP=<hex>: shapes reading that texture base are not drawn (a bisecting aid)
@@ -1558,6 +2117,7 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     if (skip_tbp >= 0 && (w[0] & 2u) && static_cast<long>(w[12]) == skip_tbp) return;
     if (s.skip == 1) {
         ++F.skipped;
+        if (prov::g_on) prov::count(prov::kSkipped);
         return;
     }
     const int n = prim == 6 ? 2 : 3;
@@ -1585,9 +2145,10 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
         ++F.skipped;
         return;
     }
-    if (y1 >= H && H < 512) {  // below the rows the target was made with: it (and its depth) become 512 rows
-        grow(s.color, 512);
-        if (s.needs_depth) grow(s.depth, 512);
+    if (y1 >= H && H < static_cast<int>(kMaxRows)) {  // below the rows the target was made with: it (and its depth) become 512 rows, or the rows drawn (up to kMaxRows)
+        const u32 rows = std::min<u32>(kMaxRows, std::max<u32>(512u, (static_cast<u32>(y1) + 32u) & ~31u));
+        grow(s.color, rows);
+        if (s.needs_depth) grow(s.depth, rows);
         H = static_cast<int>(ct.h);
     }
     if (x1 >= W || y1 >= H) {
@@ -1621,8 +2182,47 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     WGPUBindGroup group = g_dummy_group;
     u64 res = 0;
     if (s.src.kind) {
-        if (s.src.target >= 0 && s.src.target == s.color) group = self_copy(s.src.target, read_rect(w, v, n, W, H), res);
+        if (s.src.target >= 0 && s.src.target == s.color) {
+            Rect rr;
+            if (s.src.view == 4) {
+                // a draw that reads its own target through memory addresses: the target pixels of the memory pages the texels it reads lie in
+                const Target &st = *g_targets[static_cast<std::size_t>(s.src.target)];
+                const Rect tr = read_rect(w, v, n, 1 << (w[15] & 0xFFu), 1 << (w[15] >> 8));
+                u32 pw, ph;
+                page_dims(st.psm, pw, ph);
+                const u32 per_row = std::max<u32>(1, st.bw * 64 / pw);
+                rr = Rect{1 << 30, 1 << 30, -1, -1};
+                const auto add_page = [&](u32 page) {
+                    if (g_owner[page & (kPages - 1)] != s.src.target) return;  // a level memory holds is read from memory
+                    const int rel = static_cast<int>((page - st.bp / 32) & (kPages - 1));
+                    const int px = static_cast<int>((static_cast<u32>(rel) % per_row) * pw), py = static_cast<int>((static_cast<u32>(rel) / per_row) * ph);
+                    rr.x0 = std::min(rr.x0, px), rr.y0 = std::min(rr.y0, py);
+                    rr.x1 = std::max(rr.x1, px + static_cast<int>(pw) - 1), rr.y1 = std::max(rr.y1, py + static_cast<int>(ph) - 1);
+                };
+                for_pages(w[14], w[12], w[13], tr.x0, tr.y0, tr.x1, tr.y1, add_page);
+                // the mip levels the target holds too (the write-back path writes back every level's pages: mip_range)
+                if (mip_top && mip[0])
+                    for (u32 n = 1; n <= mip_top; ++n) for_pages(w[14], mip[n] & 0x3FFFu, (mip[n] >> 14) & 0x3Fu, tr.x0 >> n, tr.y0 >> n, tr.x1 >> n, tr.y1 >> n, add_page);
+                if (rr.x1 < 0) rr = Rect{0, 0, static_cast<int>(st.w) - 1, static_cast<int>(st.h) - 1};
+            } else {
+                rr = read_rect(w, v, n, W, H);
+            }
+            group = self_copy(s.src.target, rr, res, s.src.view == 3, s.src.view == 4);
+        }
         else group = s.src.group, res = s.src.res;
+    }
+    if (g_log && s.src.kind == 1 && mip_top && mip[0]) {  // how many levels the corners of this draw can sample (the same bound as the view-4 mip check)
+        const u32 m = mip[0];
+        const float k = static_cast<float>(static_cast<int32_t>(((m >> 16) & 0xFFFu) << 20) >> 20) / 16.0f;
+        float lod_max = k;
+        if (!(m & 1u) && !(w[0] & 16u)) {
+            float qmin = 1e30f;
+            for (int i = 0; i < n; ++i) qmin = std::min(qmin, std::fabs(v[i].q));
+            lod_max = qmin > 0.0f ? std::log2(1.0f / qmin) * static_cast<float>(1u << ((m >> 8) & 3u)) + k : 1e9f;
+        }
+        const u32 need = lod_max <= -0.01f ? 1u : std::min<u32>(mip_top + 1u, static_cast<u32>(std::floor(lod_max)) + 2u);
+        ++F.mipneed[std::min<u32>(need, 7u)];
+        ++F.mipdraws;
     }
     ensure_pass(s);
     Op &pass = g_ops[static_cast<std::size_t>(g_open_pass)];
@@ -1633,17 +2233,21 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     const u32 first = static_cast<u32>(g_verts.size());
     const bool fst = flags & 16u, iip = flags & 1u;
     const float sxs = 2.0f / static_cast<float>(W), sys = 2.0f / static_cast<float>(H);
+    // the vertices are written in place: the buffer grows once per shape (6 or 3), not per vertex
+    g_verts.resize(first + (prim == 6 ? 6u : 3u));
+    Vtx *out = g_verts.data() + first;
+    const u32 zmax = s.zmax, param = s.param;
+    const double zscale = s.zscale;
     const auto put = [&](float x, float y, const Vertex &col, const Vertex &tv, u32 z, u8 fog, float tq) {
-        Vtx o;
+        Vtx &o = *out++;
         o.x = (x + 0.5f) * sxs - 1.0f;  // at PS2_SCALE the card's samples sit at the centres of the GS pixel's parts (x + 1/(2 scale) ...)
         o.y = 1.0f - (y + 0.5f) * sys;
-        o.z = static_cast<float>(static_cast<double>(std::min(z, s.zmax)) / s.zscale);
+        o.z = static_cast<float>(static_cast<double>(std::min(z, zmax)) / zscale);
         o.rgba = col.r | (static_cast<u32>(col.g) << 8) | (static_cast<u32>(col.b) << 16) | (static_cast<u32>(col.a) << 24);
         if (fst) o.s = static_cast<float>(tv.u) / 16.0f, o.t = static_cast<float>(tv.v) / 16.0f, o.q = 1.0f;
         else o.s = tv.s, o.t = tv.t, o.q = tq;
         o.fog = static_cast<float>(fog);
-        o.di = s.param;
-        g_verts.push_back(o);
+        o.di = param;
     };
     if (prim == 6) {
         const Vertex &a = v[0], &b = v[1];
@@ -1709,14 +2313,24 @@ void shape(const State &st, const u32 *w, const u32 *mip, u32 mip_top, u64 seria
     // what the shape wrote: the pages it touched now belong to its targets
     if (s.cwrite_any) {
         ct.valid_w = std::max(ct.valid_w, x1 + 1), ct.valid_h = std::max(ct.valid_h, y1 + 1);
-        for_pages(ct.psm, ct.bp, ct.bw, x0, y0, x1, y1, [&](u32 page) { take_page(s.color, page); });
-        note_write(ct, x0, y0, x1, y1);
+        for_pages(ct.psm, ct.bp, ct.bw, x0, y0, x1, y1, [&](u32 page) {
+            if (static_cast<int>(page) == page_log())
+                std::fprintf(stderr, "[hwr-page] frame %llu page %u written by shape into t%d rect %d,%d-%d,%d prim %u tex %04x/%u psm %02X src t%d view %u blend %d mask %x\n",
+                             static_cast<unsigned long long>(g_frames), page, s.color, x0, y0, x1, y1, prim, w[12], w[13], w[14], s.src.target, s.src.view, s.k1.blend, s.k1.mask);
+            take_page(s.color, page);
+            ++g_page_write[page & (kPages - 1)];
+        });
+        note_write(ct, x0, y0, x1, y1, s.awrite_any);
     }
     if (s.zwrite_any && dt) {
         dt->valid_w = std::max(dt->valid_w, x1 + 1), dt->valid_h = std::max(dt->valid_h, y1 + 1);
-        for_pages(dt->psm, dt->bp, dt->bw, x0, y0, x1, y1, [&](u32 page) { take_page(s.depth, page); });
+        for_pages(dt->psm, dt->bp, dt->bw, x0, y0, x1, y1, [&](u32 page) {
+            take_page(s.depth, page);
+            ++g_page_write[page & (kPages - 1)];
+        });
     }
     ++F.drawn;
+    if (prov::g_on) prov::count(prov::kDrawn), prov::count(prov::kPixels, static_cast<std::uint64_t>(std::max(0, x1 - x0 + 1)) * static_cast<std::uint64_t>(std::max(0, y1 - y0 + 1)));
     F.vertices += nv;
     // the clear run goes on; when it reaches the right edge and covers every page of the target (and of the depth target), it becomes a clear
     if (cr.on) {
@@ -1782,6 +2396,7 @@ void upload(const u32 *rec, const u8 *bytes, std::size_t size) {
     const int full_first = static_cast<int>((done + rrw - 1) / rrw), full_last = static_cast<int>((done + pixels) / rrw) - 1;
     const int x0 = static_cast<int>(dsax), x1 = static_cast<int>(dsax + rrw - 1), y0 = static_cast<int>(dsay) + first, y1 = static_cast<int>(dsay) + last;
     for_pages(dpsm, dbp, dbw, x0, y0, x1, y1, [&](u32 page) {
+        if (g_mem_read_submit[page & (kPages - 1)] == g_submit) ++g_mem_read_hits;
         lose_page(page);
         g_page_stale[page] = false;
     });
@@ -1789,7 +2404,9 @@ void upload(const u32 *rec, const u8 *bytes, std::size_t size) {
     for_blocks(dpsm, dbp, dbw, x0, y0, x1, y1, [&](u32 b, int bx, int by, u32 bwp, u32 bhp) {
         const bool full = bx >= x0 && bx + static_cast<int>(bwp) - 1 <= x1 && by >= fy0 && by + static_cast<int>(bhp) - 1 <= fy1;
         const u64 rel = (b - dbp) & (kBlocks - 1);
-        g_block[b] = full ? mix(uid, rel) : mix(mix(g_block[b], uid), rel);
+        const u64 nid = full ? mix(uid, rel) : mix(mix(g_block[b], uid), rel);
+        if (g_mem_read_submit[(b / 32) & (kPages - 1)] == g_submit && nid != g_block[b]) ++g_mem_read_changes;   // a block a draw reads from memory gets other content
+        g_block[b] = nid;
         if (full) g_blk_stale[b] = 0;
         touch_page(b / 32);
     });
@@ -2110,6 +2727,7 @@ void add_pass_item(u32 pos, const std::vector<int> &ops, std::size_t a, std::siz
 }
 
 void schedule() {
+    const prof::Scope schedule_scope(prof::kRSchedule);
     const auto t0 = std::chrono::steady_clock::now();
     g_items.clear();
     g_pass_ops.clear();
@@ -2228,7 +2846,7 @@ void schedule() {
                 }
         }
     }
-    g_vorder.reserve(g_verts.size());
+    if (g_reorder_verts) g_vorder.reserve(g_verts.size());
     for (std::size_t i = 0; i < g_items.size(); ++i) {
         Item &it = g_items[i];
         if (it.op >= 0) continue;
@@ -2241,11 +2859,15 @@ void schedule() {
             for (u32 d = op.first_draw; d < op.first_draw + op.draw_count; ++d) {
                 const DrawRec &r = g_draws[d];
                 if (r.zread) it.zread = true;
-                const u32 at = static_cast<u32>(g_vorder.size());
-                g_vorder.insert(g_vorder.end(), g_verts.begin() + r.first, g_verts.begin() + r.first + r.count);
+                u32 at = r.first;
+                if (g_reorder_verts) {
+                    at = static_cast<u32>(g_vorder.size());
+                    g_vorder.insert(g_vorder.end(), g_verts.begin() + r.first, g_verts.begin() + r.first + r.count);
+                }
                 if (g_final.size() > it.draw_first) {
                     DrawRec &l = g_final.back();
-                    if (!l.k2 && !r.k2 && l.k1 == r.k1 && l.group == r.group && l.blend == r.blend && l.zuse == r.zuse && std::equal(l.sc, l.sc + 4, r.sc)) {
+                    if (!l.k2 && !r.k2 && l.k1 == r.k1 && l.group == r.group && l.blend == r.blend && l.zuse == r.zuse && std::equal(l.sc, l.sc + 4, r.sc) &&
+                        (g_reorder_verts || l.first + l.count == r.first)) {
                         l.count += r.count;
                         continue;
                     }
@@ -2279,7 +2901,8 @@ void schedule() {
 
 }  // namespace
 
-void prepare() {
+void prepare(bool defer_writes) {
+    const prof::Scope prepare_scope(prof::kRPrepare);
     schedule();
     const auto grow = [](WGPUBuffer &buf, u64 &size, u64 need, WGPUBufferUsage usage) {
         if (need <= size && buf) return false;
@@ -2291,89 +2914,190 @@ void prepare() {
         buf = wgpuDeviceCreateBuffer(C.device, &d);
         return true;
     };
-    const u64 vbytes = g_vorder.size() * sizeof(Vtx), pbytes = std::max<u64>(g_params.size(), 1) * 64;
+    const u64 vbytes = vsource().size() * sizeof(Vtx), pbytes = std::max<u64>(g_params.size(), 1) * 64;
     grow(g_vbuf, g_vbuf_size, vbytes, WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst);
     if (grow(g_pbuf, g_pbuf_size, pbytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst) || !g_param_group) {
         if (g_param_group) wgpuBindGroupRelease(g_param_group);
-        WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
-        e.binding = 0;
-        e.buffer = g_pbuf;
-        e.size = WGPU_WHOLE_SIZE;
+        WGPUBindGroupEntry e[4] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+        e[0].binding = 0;
+        e[0].buffer = g_pbuf;
+        e[0].size = WGPU_WHOLE_SIZE;
+        e[1].binding = 1;
+        e[1].buffer = C.clut;
+        e[1].size = WGPU_WHOLE_SIZE;
+        e[2].binding = 2;
+        e[2].buffer = g_addr;
+        e[2].size = WGPU_WHOLE_SIZE;
+        e[3].binding = 3;
+        e[3].buffer = C.vram ? C.vram : g_addr;  // no memory (PS2_SCALE > 1): the levels are never read from it (shape() keeps them on the old way)
+        e[3].size = WGPU_WHOLE_SIZE;
         WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
         d.layout = g_params_layout;
-        d.entryCount = 1;
-        d.entries = &e;
+        d.entryCount = 4;
+        d.entries = e;
         g_param_group = wgpuDeviceCreateBindGroup(C.device, &d);
     }
-    if (vbytes) wgpuQueueWriteBuffer(C.queue, g_vbuf, 0, g_vorder.data(), vbytes);
+    if (defer_writes) return;
+    if (vbytes) wgpuQueueWriteBuffer(C.queue, g_vbuf, 0, vsource().data(), vbytes);
     if (!g_params.empty()) wgpuQueueWriteBuffer(C.queue, g_pbuf, 0, g_params.data(), g_params.size() * 64);
 }
 
 namespace {
 
-// PS2_HWR_TIME=1: the card's time of each render pass (timestamp queries; the frame waits for them), summed per target and printed every
-// 100 frames. A measuring aid.
-struct PassTimer {
+// PS2_GPU_PROFILE=1 (or PS2_HWR_TIME=1): the card's time of every piece of the renderer's work, from timestamps the card writes at the start
+// and end of each render pass and compute pass (copies are bracketed by two empty compute passes). Each piece gets a name: its kind, the
+// target (address, format, size in GS pixels and card texels) and, for a render pass, its draws and whether it loads/stores. The gaps
+// between pieces are the gpu.cpp work between them (texture uploads, palettes, decodes) and are named after the piece that follows.
+// Every PS2_GPU_PROFILE_N frames (default 50) the log gets the span of a frame on the card, the sum of the pieces, and the 30 dearest names
+// in ms per frame; a frame whose span passes 20 ms gets a [gpu-slow] line with its 6 dearest pieces. The frame waits for its timestamps,
+// so the frame rate drops a little while it is on; the pieces' own times stay true.
+struct GpuProf {
     bool on = false;
     WGPUQuerySet set = nullptr;
     WGPUBuffer resolve = nullptr, read = nullptr;
-    static constexpr u32 kMax = 64;
-    u32 used = 0;
-    u32 bp[kMax] = {};
-    double sum_ms[kMax] = {};  // by pass index of the frame
-    u32 sum_bp[kMax] = {};
-    double total = 0;
-    u32 frames = 0;
-} g_pt;
+    static constexpr u32 kMax = 1024;  // timestamps a frame (pairs: 512 pieces)
+    u32 used = 0;                      // timestamps written this frame
+    struct Piece {
+        std::string name;
+        u32 begin, end;  // timestamp indices
+    };
+    std::vector<Piece> pieces;
+    struct Sum {
+        double ms = 0;
+        u64 n = 0;
+    };
+    std::unordered_map<std::string, Sum> sums;
+    double span = 0, worst = 0, sum_pieces = 0, sum_gaps = 0;
+    u32 frames = 0, every = 50, slow = 0;
+    double period_ns = 1.0;
+} g_gp;
 
 void timer_init() {
-    g_pt.on = os::env("PS2_HWR_TIME") == "1";
-    if (!g_pt.on) return;
+    g_gp.on = os::env("PS2_GPU_PROFILE") == "1" || os::env("PS2_HWR_TIME") == "1";
+    if (!g_gp.on) return;
+    if (!wgpuDeviceHasFeature(C.device, WGPUFeatureName_TimestampQuery)) {
+        std::fprintf(stderr, "[gpu-prof] the device has no timestamp queries: PS2_GPU_PROFILE is off\n");
+        g_gp.on = false;
+        return;
+    }
+    if (const long n = std::atol(os::env("PS2_GPU_PROFILE_N").c_str()); n > 0) g_gp.every = static_cast<u32>(n);
     WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
     qd.type = WGPUQueryType_Timestamp;
-    qd.count = PassTimer::kMax * 2;
-    g_pt.set = wgpuDeviceCreateQuerySet(C.device, &qd);
+    qd.count = GpuProf::kMax;
+    g_gp.set = wgpuDeviceCreateQuerySet(C.device, &qd);
     WGPUBufferDescriptor d = WGPU_BUFFER_DESCRIPTOR_INIT;
-    d.size = PassTimer::kMax * 16;
+    d.size = GpuProf::kMax * 8;
     d.usage = WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc;
-    g_pt.resolve = wgpuDeviceCreateBuffer(C.device, &d);
+    g_gp.resolve = wgpuDeviceCreateBuffer(C.device, &d);
     d.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
-    g_pt.read = wgpuDeviceCreateBuffer(C.device, &d);
-    if (!g_pt.set) g_pt.on = false;
+    g_gp.read = wgpuDeviceCreateBuffer(C.device, &d);
+    g_gp.period_ns = wgpuQueueGetTimestampPeriod(C.queue);
+    if (!(g_gp.period_ns > 0)) g_gp.period_ns = 1.0;
+    if (!g_gp.set) g_gp.on = false;
+    std::fprintf(stderr, "[gpu-prof] on: every render pass, compute pass and copy of the renderer is timed (%.3f ns per tick), report every %u frames\n",
+                 g_gp.period_ns, g_gp.every);
+}
+
+// two timestamp slots for a piece named `name`; false when the frame's slots are used up
+bool prof_take(std::string name, u32 &b, u32 &e) {
+    if (!g_gp.on || g_gp.used + 2 > GpuProf::kMax) return false;
+    b = g_gp.used++, e = g_gp.used++;
+    g_gp.pieces.push_back({std::move(name), b, e});
+    return true;
+}
+
+// an empty compute pass that writes its start (begin) or its end (end) timestamp: brackets a copy
+void prof_mark(WGPUCommandEncoder enc, u32 index, bool at_end) {
+    WGPUPassTimestampWrites tw = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+    tw.querySet = g_gp.set;
+    if (at_end) tw.beginningOfPassWriteIndex = index;   // the copy's end: the next pass starts after it
+    else tw.endOfPassWriteIndex = index;                // the copy's start: this pass ends before it
+    WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+    cd.timestampWrites = &tw;
+    WGPUComputePassEncoder cp = wgpuCommandEncoderBeginComputePass(enc, &cd);
+    wgpuComputePassEncoderEnd(cp);
+    wgpuComputePassEncoderRelease(cp);
+}
+
+std::string target_name(int ti) {
+    if (ti < 0 || static_cast<std::size_t>(ti) >= g_targets.size() || !g_targets[static_cast<std::size_t>(ti)]) return "t?";
+    const Target &t = *g_targets[static_cast<std::size_t>(ti)];
+    char b[96];
+    std::snprintf(b, sizeof b, "%s %04X/%u psm %02X %ux%u (%ux%u)", t.depth ? "Z" : "C", t.bp, t.bw, t.psm, t.w, t.h, card_x(t.w, t.sc), card_y(t.h, t.sc));
+    return b;
 }
 
 void timer_resolve(WGPUCommandEncoder enc) {
-    if (!g_pt.on || !g_pt.used) return;
-    wgpuCommandEncoderResolveQuerySet(enc, g_pt.set, 0, g_pt.used * 2, g_pt.resolve, 0);
-    wgpuCommandEncoderCopyBufferToBuffer(enc, g_pt.resolve, 0, g_pt.read, 0, g_pt.used * 16);
+    if (!g_gp.on || !g_gp.used) return;
+    wgpuCommandEncoderResolveQuerySet(enc, g_gp.set, 0, g_gp.used, g_gp.resolve, 0);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, g_gp.resolve, 0, g_gp.read, 0, static_cast<u64>(g_gp.used) * 8);
 }
 
 void timer_read() {
-    if (!g_pt.on || !g_pt.used) return;
+    if (!g_gp.on) return;
+    const prof::Scope prof_scope(prof::kRProfile);
+    if (!g_gp.used) {
+        g_gp.pieces.clear();
+        return;
+    }
     bool done = false;
     WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
     cb.mode = WGPUCallbackMode_AllowProcessEvents;
     cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
     cb.userdata1 = &done;
-    wgpuBufferMapAsync(g_pt.read, WGPUMapMode_Read, 0, g_pt.used * 16, cb);
+    wgpuBufferMapAsync(g_gp.read, WGPUMapMode_Read, 0, static_cast<u64>(g_gp.used) * 8, cb);
     while (!done) wgpuDevicePoll(C.device, true, nullptr);
-    const u64 *t = static_cast<const u64 *>(wgpuBufferGetConstMappedRange(g_pt.read, 0, g_pt.used * 16));
-    const double period = 1e-6;  // wgpu reports timestamps in nanoseconds
-    if (t)
-        for (u32 i = 0; i < g_pt.used; ++i) {
-            const double ms = t[2 * i + 1] > t[2 * i] ? static_cast<double>(t[2 * i + 1] - t[2 * i]) * period : 0.0;
-            g_pt.sum_ms[i] += ms;
-            g_pt.sum_bp[i] = g_pt.bp[i];
-            g_pt.total += ms;
+    const u64 *t = static_cast<const u64 *>(wgpuBufferGetConstMappedRange(g_gp.read, 0, static_cast<u64>(g_gp.used) * 8));
+    const double ms_per_tick = g_gp.period_ns * 1e-6;
+    const auto ms = [&](u64 a, u64 b) { return b > a ? static_cast<double>(b - a) * ms_per_tick : 0.0; };
+    if (t && !g_gp.pieces.empty()) {
+        std::vector<std::pair<double, const std::string *>> frame;
+        u64 first = ~0ull, last = 0;
+        for (std::size_t i = 0; i < g_gp.pieces.size(); ++i) {
+            const auto &p = g_gp.pieces[i];
+            const u64 a = t[p.begin], b = t[p.end];
+            if (!a || !b) continue;
+            first = std::min(first, a), last = std::max(last, b);
+            const double d = ms(a, b);
+            if (p.name == "compute") continue;  // a compute pass that ran no program (begun and ended around the renderer's work)
+            GpuProf::Sum &s = g_gp.sums[p.name];
+            s.ms += d, ++s.n;
+            g_gp.sum_pieces += d;
+            frame.push_back({d, &p.name});
+            if (i + 1 < g_gp.pieces.size()) {  // what ran between this piece and the next: gpu.cpp's uploads, palettes and decodes
+                const u64 nb = t[g_gp.pieces[i + 1].begin];
+                const double gap = nb > b ? ms(b, nb) : 0.0;
+                if (gap > 0.002) {
+                    GpuProf::Sum &g = g_gp.sums["(card idle: waiting for the next submit) before " + g_gp.pieces[i + 1].name.substr(0, g_gp.pieces[i + 1].name.find(' '))];
+                    g.ms += gap, ++g.n;
+                    g_gp.sum_gaps += gap;
+                }
+            }
         }
-    wgpuBufferUnmap(g_pt.read);
-    g_pt.used = 0;
-    if (++g_pt.frames == 100) {
-        std::fprintf(stderr, "[hwr-time] render passes %.3f ms per frame:", g_pt.total / 100.0);
-        for (u32 i = 0; i < PassTimer::kMax && g_pt.sum_ms[i] > 0; ++i) std::fprintf(stderr, " %u:%04x %.3f", i, g_pt.sum_bp[i], g_pt.sum_ms[i] / 100.0);
-        std::fprintf(stderr, "\n");
-        g_pt.total = 0, g_pt.frames = 0;
-        std::fill(std::begin(g_pt.sum_ms), std::end(g_pt.sum_ms), 0.0);
+        const double span = first < last ? ms(first, last) : 0.0;
+        g_gp.span += span, g_gp.worst = std::max(g_gp.worst, span);
+        if (span > 20.0 && g_gp.slow++ < 40) {
+            std::sort(frame.begin(), frame.end(), [](const auto &x, const auto &y) { return x.first > y.first; });
+            std::fprintf(stderr, "[gpu-slow] hwr frame %llu: %.2f ms on the card (%zu pieces); dearest:", static_cast<unsigned long long>(g_frames), span, frame.size());
+            for (std::size_t k = 0; k < frame.size() && k < 6; ++k) std::fprintf(stderr, " | %.2f %s", frame[k].first, frame[k].second->c_str());
+            std::fprintf(stderr, "\n");
+        }
+    }
+    wgpuBufferUnmap(g_gp.read);
+    g_gp.used = 0;
+    g_gp.pieces.clear();
+    if (++g_gp.frames >= g_gp.every) {
+        const double f = static_cast<double>(g_gp.frames);
+        std::vector<std::pair<std::string, GpuProf::Sum>> rows(g_gp.sums.begin(), g_gp.sums.end());
+        std::sort(rows.begin(), rows.end(), [](const auto &x, const auto &y) { return x.second.ms > y.second.ms; });
+        std::fprintf(stderr, "[gpu-prof] %u frames: card WORK %.2f ms a frame (the sum of the timed pieces below), idle between submits %.2f ms, "
+                             "first to last timestamp %.2f ms (worst %.2f); frames whose work passed 20 ms: %u\n",
+                     g_gp.frames, g_gp.sum_pieces / f, g_gp.sum_gaps / f, g_gp.span / f, g_gp.worst, g_gp.slow);
+        for (std::size_t k = 0; k < rows.size() && k < 30; ++k)
+            std::fprintf(stderr, "[gpu-prof]   %7.3f ms  %5.1f x  %s\n", rows[k].second.ms / f, static_cast<double>(rows[k].second.n) / f, rows[k].first.c_str());
+        g_gp.sums.clear();
+        g_gp.span = g_gp.worst = g_gp.sum_pieces = g_gp.sum_gaps = 0;
+        g_gp.frames = 0, g_gp.slow = 0;
     }
 }
 
@@ -2413,19 +3137,23 @@ void encode_pass(WGPUCommandEncoder enc, const Item &it) {
         if (it.store_d) ++F.att_stores, F.att_store_bytes += dbytes;
     }
     WGPUPassTimestampWrites tw = WGPU_PASS_TIMESTAMP_WRITES_INIT;
-    if (g_pt.on && g_pt.used < PassTimer::kMax) {
-        tw.querySet = g_pt.set;
-        tw.beginningOfPassWriteIndex = g_pt.used * 2;
-        tw.endOfPassWriteIndex = g_pt.used * 2 + 1;
-        rd.timestampWrites = &tw;
+    if (g_gp.on) {
         const Op &f = g_ops[static_cast<std::size_t>(g_pass_ops[it.first])];
-        g_pt.bp[g_pt.used++] = f.tgt >= 0 && g_targets[static_cast<std::size_t>(f.tgt)] ? g_targets[static_cast<std::size_t>(f.tgt)]->bp : 0xFFFF;
+        std::string name = "pass " + target_name(f.tgt) + (it.clear_c ? " clear" : " load") + (it.store_c ? "+store" : "+discard");
+        if (it.ds) name += it.clear_d ? " +Z clear" : " +Z";
+        u32 b, e;
+        if (prof_take(std::move(name), b, e)) {
+            tw.querySet = g_gp.set;
+            tw.beginningOfPassWriteIndex = b;
+            tw.endOfPassWriteIndex = e;
+            rd.timestampWrites = &tw;
+        }
     }
     WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
     ++F.passes;
     static const bool no_draw = os::env("PS2_HWR_NOPASS") == "draws";  // measuring aid: render passes without their draws
     if (it.draw_n && !no_draw && g_sweep != 1) {
-        wgpuRenderPassEncoderSetVertexBuffer(rp, 0, g_vbuf, 0, g_vorder.size() * sizeof(Vtx));
+        wgpuRenderPassEncoderSetVertexBuffer(rp, 0, g_vbuf, 0, vsource().size() * sizeof(Vtx));
         wgpuRenderPassEncoderSetBindGroup(rp, 0, g_param_group, 0, nullptr);
         WGPURenderPipeline cur = nullptr;
         WGPUBindGroup cur_group = nullptr;
@@ -2469,6 +3197,10 @@ void encode_pass(WGPUCommandEncoder enc, const Item &it) {
 }
 
 void encode_op(WGPUCommandEncoder enc, const Op &op) {
+    // PS2_GPU_SWEEP parts 5, 6, 7: the target <-> memory transfers, the copies of targets and the copies of decoded texture levels are left out
+    if ((g_sweep == 5 && (op.kind == kOpLoad || op.kind == kOpStore || op.kind == kOpStoreZ)) || (g_sweep == 6 && op.kind == kOpSelfCopy) ||
+        (g_sweep == 7 && op.kind == kOpCopyLevel))
+        return;
     switch (op.kind) {
     case kOpPass:
         return;
@@ -2490,6 +3222,13 @@ void encode_op(WGPUCommandEncoder enc, const Op &op) {
         src.texture = op.tex;
         WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
         dst.texture = op.tex2;
+        if (op.level == 1) {  // a part (self_copy): card origin and size
+            src.origin = {op.offset, op.pitch, 0};
+            dst.origin = {op.offset, op.pitch, 0};
+            const WGPUExtent3D part{op.w, op.h, 1};
+            wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &part);
+            return;
+        }
         const WGPUExtent3D size{card_x(op.w, op.sc), card_y(op.h, op.sc), 1};
         wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &size);
         return;
@@ -2530,18 +3269,114 @@ void encode_op(WGPUCommandEncoder enc, const Op &op) {
 
 }  // namespace
 
+int prof_compute(WGPUPassTimestampWrites &tw) {
+    if (!g_gp.on) return -1;
+    u32 b, e;
+    if (!prof_take("compute", b, e)) return -1;
+    tw = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+    tw.querySet = g_gp.set;
+    tw.beginningOfPassWriteIndex = b;
+    tw.endOfPassWriteIndex = e;
+    return static_cast<int>(g_gp.pieces.size() - 1);
+}
+
+void prof_name(int piece, const char *program) {
+    if (piece < 0 || static_cast<std::size_t>(piece) >= g_gp.pieces.size()) return;
+    std::string &n = g_gp.pieces[static_cast<std::size_t>(piece)].name;
+    const std::string p = std::string(" ") + program;
+    if (n.find(p) == std::string::npos) n += p;   // "compute decode palette ...": the programs the pass runs, once each
+}
+
 WGPUComputePassEncoder encode(WGPUCommandEncoder enc, u32 upto, WGPUComputePassEncoder pass) {
+    const prof::Scope encode_scope(prof::kREncode);
     if (pass) {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
     while (g_next_item < g_items.size() && g_items[g_next_item].pos <= upto) {
         const Item &it = g_items[g_next_item++];
-        if (it.op >= 0) encode_op(enc, g_ops[static_cast<std::size_t>(it.op)]);
-        else encode_pass(enc, it);
+        if (it.op >= 0) {
+            const Op &op = g_ops[static_cast<std::size_t>(it.op)];
+            u32 b = 0, e = 0;
+            bool timed = false;
+            if (g_gp.on && op.kind != kOpPass) {
+                static const char *const kKind[] = {"pass", "load", "store", "storeZ", "self copy", "level copy", "show"};
+                const char *kind = "op";
+                switch (op.kind) {
+                case kOpLoad: kind = kKind[1]; break;
+                case kOpStore: kind = kKind[2]; break;
+                case kOpStoreZ: kind = kKind[3]; break;
+                case kOpSelfCopy: kind = kKind[4]; break;
+                case kOpCopyLevel: kind = kKind[5]; break;
+                case kOpShow: kind = kKind[6]; break;
+                default: break;
+                }
+                char extra[48] = "";
+                if (op.kind == kOpCopyLevel) std::snprintf(extra, sizeof extra, " %ux%u", op.w, op.h);
+                timed = prof_take(std::string(kind) + " " + (op.kind == kOpCopyLevel ? std::string("texture") : target_name(op.tgt)) + extra, b, e);
+                if (timed) prof_mark(enc, b, false);
+            }
+            encode_op(enc, op);
+            if (timed) prof_mark(enc, e, true);
+        } else {
+            encode_pass(enc, it);
+        }
     }
     if (upto == ~0u) timer_resolve(enc);
     return nullptr;
+}
+
+struct Handoff {
+    std::vector<WGPUBindGroup> groups;
+    std::vector<WGPUTextureView> views;
+    std::vector<WGPUTexture> texs;
+    std::vector<Vtx> verts;                    // handoff(true): this submit's vertices and parameter records, written by the job
+    std::vector<std::array<u32, 16>> params;
+    WGPUBuffer vbuf = nullptr, pbuf = nullptr;  // (referenced for the job: the buffers may grow and be replaced before it runs)
+};
+namespace {
+std::mutex g_handoff_mutex;
+std::vector<Handoff *> g_handoff_pool;  // finished hand-overs, their vectors keep their room (a frame's vertices are megabytes)
+}
+Handoff *handoff(bool take_writes) {
+    Handoff *h = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_handoff_mutex);
+        if (!g_handoff_pool.empty()) h = g_handoff_pool.back(), g_handoff_pool.pop_back();
+    }
+    if (!h) h = new Handoff;
+    h->groups.swap(g_release_group);
+    h->views.swap(g_release_view);
+    h->texs.swap(g_release_tex);
+    if (take_writes) {  // (taken after encode: nothing of this submit reads them from hwr any more; submitted() clears what is left)
+        std::vector<Vtx> &source = g_reorder_verts ? g_vorder : g_verts;
+        h->verts.swap(source);
+        h->params.swap(g_params);
+        h->vbuf = g_vbuf;
+        h->pbuf = g_pbuf;
+        if (h->vbuf) wgpuBufferAddRef(h->vbuf);
+        if (h->pbuf) wgpuBufferAddRef(h->pbuf);
+    }
+    return h;
+}
+void handoff_write(Handoff *h) {
+    if (!h->verts.empty() && h->vbuf) wgpuQueueWriteBuffer(C.queue, h->vbuf, 0, h->verts.data(), h->verts.size() * sizeof(Vtx));
+    if (!h->params.empty() && h->pbuf) wgpuQueueWriteBuffer(C.queue, h->pbuf, 0, h->params.data(), h->params.size() * 64);
+}
+void handoff_release(Handoff *h) {
+    for (WGPUBindGroup g : h->groups) wgpuBindGroupRelease(g);
+    for (WGPUTextureView v : h->views) wgpuTextureViewRelease(v);
+    for (WGPUTexture t : h->texs) wgpuTextureDestroy(t), wgpuTextureRelease(t);
+    h->groups.clear();
+    h->views.clear();
+    h->texs.clear();
+    if (h->vbuf) wgpuBufferRelease(h->vbuf);
+    if (h->pbuf) wgpuBufferRelease(h->pbuf);
+    h->vbuf = h->pbuf = nullptr;
+    h->verts.clear();
+    h->params.clear();
+    std::lock_guard<std::mutex> lock(g_handoff_mutex);
+    g_handoff_pool.push_back(h);
 }
 
 void submitted() {
@@ -2593,6 +3428,16 @@ void frame_end() {
             if (F.fallback[r]) std::fprintf(stderr, " | FALLBACK %s %llu", kReasonName[r], static_cast<unsigned long long>(F.fallback[r]));
         for (int r = 0; r < kApproxes; ++r)
             if (F.approx[r]) std::fprintf(stderr, " | approx %s %llu", kApproxName[r], static_cast<unsigned long long>(F.approx[r]));
+        if (F.view4_out) std::fprintf(stderr, " | view 4 outside its target %llu", static_cast<unsigned long long>(F.view4_out));
+        if (F.mipdraws)
+            std::fprintf(stderr, " | mipmapped draws %llu needing 1/2/3/4+ levels: %llu/%llu/%llu/%llu", static_cast<unsigned long long>(F.mipdraws), static_cast<unsigned long long>(F.mipneed[1]),
+                         static_cast<unsigned long long>(F.mipneed[2]), static_cast<unsigned long long>(F.mipneed[3]),
+                         static_cast<unsigned long long>(F.mipneed[4] + F.mipneed[5] + F.mipneed[6] + F.mipneed[7]));
+        if (g_mem_read_hits) std::fprintf(stderr, " | uploads into pages a draw reads from memory %llu", static_cast<unsigned long long>(g_mem_read_hits));
+        if (g_mem_read_changes) std::fprintf(stderr, " | of them with other content %llu", static_cast<unsigned long long>(g_mem_read_changes));
+        g_mem_read_hits = g_mem_read_changes = 0;
+        std::fprintf(stderr, " | states built %llu (%.2f ms, %llu for the epoch)", static_cast<unsigned long long>(F.builds), F.build_ms,
+                     static_cast<unsigned long long>(F.builds_epoch));
         std::fprintf(stderr, "\n");
     }
     T.shapes += F.shapes, T.drawn += F.drawn, T.skipped += F.skipped, T.clears += F.clears, T.draws += F.draws, T.passes += F.passes, T.pipelines += F.pipelines;
@@ -2648,10 +3493,16 @@ void sync_all() {}
 void state_loaded() {}
 bool pending() { return false; }
 bool before(std::uint32_t) { return false; }
-void prepare() {}
+void prepare(bool) {}
 WGPUComputePassEncoder encode(WGPUCommandEncoder, std::uint32_t, WGPUComputePassEncoder pass) { return pass; }
+struct Handoff {};
+Handoff *handoff(bool) { return nullptr; }
+void handoff_write(Handoff *) {}
+void handoff_release(Handoff *) {}
 void submitted() {}
 void frame_end() {}
+int prof_compute(WGPUPassTimestampWrites &) { return -1; }
+void prof_name(int, const char *) {}
 void stats() {}
 }
 #endif

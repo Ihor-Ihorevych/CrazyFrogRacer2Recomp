@@ -33,7 +33,19 @@ enum Label : std::uint8_t {
     kTilesWait,   // tile helper thread: waiting for shapes
     kPresentWait, // emulation thread: too many pictures are queued for the screen, it waits for the drawing thread to show some
     kWgpuBase,    // 16 labels from here: the wgpu calls, in the order of wt::Kind in gs/gpu/gpu.cpp
-    kLabels = kWgpuBase + 16
+    // drawing thread, inside render-work (the hardware renderer, hwr.cpp): where its processor time goes
+    kRGs = kWgpuBase + 16,  // r:gs-cmds    the GS command stream played back (GIF packets, register writes, vertex kicks) outside the parts below
+    kRShape,                // r:shape      a shape turned into card vertices and bookkeeping (hwr::shape, without its state set-up)
+    kRBuild,                // r:build      a shape's state worked out (build_state: targets, texture, pipeline key)
+    kRSchedule,             // r:schedule   the frame's passes and copies ordered (schedule / build_graph)
+    kRPrepare,              // r:prepare    vertex and parameter data written to the card
+    kREncode,               // r:encode     render passes, draws and copies recorded (the w: labels inside it are wgpu's own calls)
+    kRProfile,              // r:gpu-prof   PS2_GPU_PROFILE's own reading of the timestamps
+    // vector unit thread, inside vu-work: VIF packets (unpack, MSCAL), the programs, and the packets they send on
+    kVVif,                  // v:vif        VIF1 packets parsed and played (UNPACK into VU memory, MSCAL starts) outside the labels below
+    kVProg,                 // v:program    a compiled program's body
+    kVKick,                 // v:xgkick     a program's packet handed on (GIF parsing, the queue to the drawing thread)
+    kLabels
 };
 
 extern bool g_on;

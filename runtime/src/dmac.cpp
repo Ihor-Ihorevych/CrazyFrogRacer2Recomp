@@ -7,6 +7,7 @@
 #include "gs/gs.hpp"
 #include "ipu/ipu.hpp"
 #include "hw.hpp"
+#include "prov.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 #include "vif.hpp"
@@ -359,6 +360,29 @@ void start(int ch) {
     c.paused = false;
     c.tag_end = c.qwc && chain_ends_after_current(c);
     ++g_starts[ch];
+    if (prov::g_on) {
+        prov::ee_kick(ch);
+        if (prov::g_writers && (ch == 1 || ch == 2 || ch == 8 || ch == 9)) {
+            // the memory this transfer reads: the data of a normal transfer, or every tag and every block of the chain
+            if (((c.chcr >> 2) & 3u) != 1u) {
+                prov::mark_dma(c.madr, c.qwc * 16u);
+            } else {
+                std::uint32_t tadr = c.tadr;
+                prov::mark_dma(c.madr, c.qwc * 16u);
+                for (int guard = 0; guard < 30000; ++guard) {
+                    std::uint64_t tag;
+                    std::memcpy(&tag, source(tadr), 8);
+                    const std::uint32_t qwc = static_cast<std::uint32_t>(tag) & 0xFFFFu, id = static_cast<std::uint32_t>(tag >> 28) & 7u;
+                    const std::uint32_t addr = static_cast<std::uint32_t>(tag >> 32) & 0x7FFFFFF0u;
+                    prov::mark_dma(tadr, 16);
+                    if (id == 0 || id == 3 || id == 4) prov::mark_dma(addr, qwc * 16u);
+                    else prov::mark_dma(tadr + 16, qwc * 16u);
+                    if (id == 0 || id == 7 || id == 5 || id == 6) break;                    // refe, end, call, ret
+                    tadr = id == 1 ? tadr + 16 + qwc * 16u : id == 2 ? addr : tadr + 16;    // cnt, next, ref/refs
+                }
+            }
+        }
+    }
     static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
     if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s ctrl 0x%X rbsr 0x%X rbor 0x%X pcr 0x%X enable 0x%X\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
                             kernel::current_thread(), kernel::in_handler() ? " (handler)" : "", g_ctrl, g_rbsr, g_rbor, g_pcr, g_enable);
@@ -476,6 +500,8 @@ void stats() {
     std::fprintf(stderr, "[dma] starts:");
     for (int ch = 0; ch < 10; ++ch) std::fprintf(stderr, " ch%d=%llu", ch, static_cast<unsigned long long>(g_starts[ch]));
     std::fprintf(stderr, "\n");
+    for (int ch : {3, 4})
+        std::fprintf(stderr, "[dma] ch%d at the end: chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X tag_end %d\n", ch, g_ch[ch].chcr, g_ch[ch].madr, g_ch[ch].qwc, g_ch[ch].tadr, g_ch[ch].tag_end);
 }
 
 // CPCOND0, the condition COP0 branches (bc0t, bc0f) test: true while every channel selected in

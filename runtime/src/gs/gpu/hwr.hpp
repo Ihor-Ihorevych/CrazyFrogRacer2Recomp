@@ -37,6 +37,9 @@ struct Context {
     std::uint32_t scale = 1;           // PS2_SCALE: graphics memory keeps scale^2 samples per word
     float target_scale = 0.0f;         // PS2_HWR_SCALE: card texels per GS pixel of the targets (any size, e.g. 1.35); 0 = scale
     bool gl = false;                   // OpenGL (ES): no storage buffers in vertex shaders (Mali); the fragment stage reads the draw records (hwr.wgsl vs_gl)
+    std::size_t swizzle_size = 0;      // words in `swizzle`
+    WGPUBuffer clut = nullptr;         // gpu.cpp's palettes (2048 slots of 512 words): a CT32 target read as T8H is looked up here by the draw (hwr.wgsl view 3)
+    WGPUBuffer vram = nullptr;         // gpu.cpp's graphics memory (PS2_SCALE 1 only): mip levels a view-4 draw reads from memory (hwr.wgsl view4_at)
 };
 
 bool requested();  // PS2_RENDERER=hw
@@ -73,10 +76,21 @@ void state_loaded();
 // submit(): hwr's work goes into the same command encoder as gpu.cpp's compute commands, in stream order
 bool pending();
 bool before(std::uint32_t command);   // hwr work waits that goes before compute command `command`
-void prepare();                        // the submit's vertex and parameter data go to the card (one write each)
+void prepare(bool defer_writes = false);  // the submit's vertex and parameter data go to the card (one write each; defer_writes: handoff(true) takes them for the job)
 WGPUComputePassEncoder encode(WGPUCommandEncoder enc, std::uint32_t upto, WGPUComputePassEncoder pass);
 void submitted();                      // the submit is done: per-submit state is cleared, textures dropped in it are released
 void frame_end();                      // vblank: counters (PS2_HWR_LOG=1 prints one line per frame)
+// With the submit thread (gpu.cpp post): what this submit releases after the commands are submitted (the textures of dropped cache entries
+// and their groups) goes with the job instead of being released at once, when the commands that use them have not been submitted yet.
+struct Handoff;
+Handoff *handoff(bool take_writes);    // the releases of this submit, taken out of hwr (call after encode, before the hand-over); take_writes: and the vertex
+                                       // and parameter data of a prepare(true), to be written by the job
+void handoff_write(Handoff *h);        // the submit thread, before the job's commands are finished: the taken vertex and parameter writes
+void handoff_release(Handoff *h);      // the submit thread, after wgpuQueueSubmit
+// PS2_GPU_PROFILE=1: gpu.cpp's compute passes of a renderer frame get timestamps too. prof_compute fills `tw` for the pass about to begin
+// and returns its piece (-1: not profiling, or the frame's slots are used up); prof_name adds a program's name to that piece.
+int prof_compute(WGPUPassTimestampWrites &tw);
+void prof_name(int piece, const char *program);
 void stats();                          // end of the run: totals
 
 }

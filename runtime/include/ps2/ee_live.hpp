@@ -9,6 +9,7 @@
 // loads it, adds it to the modules it has (add_modules) and goes on. The libraries stay in a cache folder next to the game.
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <span>
 
@@ -23,6 +24,13 @@ void start(const std::string &program, const std::string &cache, const std::stri
 void start(std::span<const std::uint8_t> program, const std::string &cache, const std::string &game_dir);
 
 bool active();
+
+// ps2run --prebuild: translates and compiles all of the program's own code in one go (every code segment of the executable that is in
+// memory, analysed from its entry point, the entries of the game folder's entries.txt and the pointers into it), at the normal
+// optimisation level, into the cache as a library like the ones a stop makes. The next start loads it and the game never stops for code
+// of the program itself. This is what the Android app does once, on the phone, right after the player picked the disc. The executable
+// must be loaded into memory (ps2::load_elf) and start() called. `progress` gets a line for every stage and "compiled n of m files".
+bool prebuild(const std::function<void(const std::string &)> &progress);
 
 // The main processor reached pc where nothing is translated. True when code for pc was translated, compiled and loaded (the caller
 // looks again); false when that is not possible (nothing is changed; the reason is in the log).
